@@ -1105,6 +1105,36 @@ mod gpu {
     }
 
     #[test]
+    fn gpu_128_threads_ds_swizzle_xor2() {
+        let mut code = ds_op(0x35, 0x1F, 0x08, 0, 0, 2).to_vec();
+        emit_uav_store(&mut code, 2, 0);
+        code.push(S_ENDPGM);
+
+        let prog = make_cs_program(&code, [128, 1, 1], 0, false);
+        let expected: Vec<u32> = (0..128).map(|lane| lane ^ 2).collect();
+        run_on_hosts("ds_swizzle_xor2", &prog, [1, 1, 1], 128, &expected, true);
+    }
+
+    #[test]
+    fn gpu_128_threads_dpp_row_shr_mask_a() {
+        // Disabled rows keep the old destination, 1. Enabled rows add the previous lane.
+        let mut code = vec![v_mov_b32(3, inline_u(1))];
+        code.extend_from_slice(&dpp_row_shr(0x25, 3, 0, 0, 0x111, 0xA));
+        emit_uav_store(&mut code, 3, 0);
+        code.push(S_ENDPGM);
+
+        let prog = make_cs_program(&code, [128, 1, 1], 0, false);
+        let expected: Vec<u32> = (0..128)
+            .map(|lane| match (lane / 16 % 2, lane % 16) {
+                (0, _) => 1,
+                (_, 0) => lane,
+                _ => lane + (lane - 1),
+            })
+            .collect();
+        run_on_hosts("dpp_row_shr_mask_a", &prog, [1, 1, 1], 128, &expected, true);
+    }
+
+    #[test]
     fn gpu_128_threads_ds_swizzle_and_dpp_row_mask() {
         // 1. ds_swizzle_b32 XOR 2 within 32-lane halves (offset = 0x1F | (2 << 10) = 0x81F)
         // 2. v_add_nc_u32_dpp row_shr:1 bound_ctrl:1 with row_mask = 0xA (rows 1 & 3 enabled, rows 0 & 2 masked!)
