@@ -1104,6 +1104,15 @@ fn run_sample_cases(
     sampler: windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC,
     cases: &[([u32; 4], [f32; 4])],
 ) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+    let depths: Vec<f32>;
+    let srv = if sampler.Filter == D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT {
+        depths = texels.iter().map(|t| t[0]).collect();
+        View::Depth(4, 4, &depths)
+    } else {
+        View::Texture(4, 4, texels)
+    };
+    let views = [srv, View::RawUav(4)];
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -1129,7 +1138,7 @@ fn run_sample_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::Texture(4, 4, texels), View::RawUav(4)],
+                        views: &views,
                         samplers: &[sampler],
                         groups: [1, 1, 1],
                     },
