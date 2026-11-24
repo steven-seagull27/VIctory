@@ -910,6 +910,8 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// A depth texture with an R32_FLOAT SRV (width, height, depths).
+    Depth(u32, u32, &'a [f32]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
@@ -1150,6 +1152,71 @@ impl Host {
                             (faces == 6).then_some(&cube as *const _),
                             at,
                         );
+                        keep.push(tex);
+                    }
+                    View::Depth(w, h, depths) => {
+                        let desc = texture_as(
+                            w,
+                            h,
+                            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                            DXGI_FORMAT_R32_TYPELESS,
+                        );
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                        dev.GetCopyableFootprints(
+                            &desc,
+                            0,
+                            1,
+                            0,
+                            Some(&mut layout),
+                            None,
+                            None,
+                            None,
+                        );
+                        let pitch_words = layout.Footprint.RowPitch as usize / 4;
+                        if depths.len() != w as usize * h as usize {
+                            return Err("depth texture size does not match its texels".into());
+                        }
+                        let mut rows = vec![0; pitch_words * h as usize];
+                        for (row, src) in rows
+                            .chunks_exact_mut(pitch_words)
+                            .zip(depths.chunks_exact(w as usize))
+                        {
+                            for (dst, depth) in row.iter_mut().zip(src) {
+                                *dst = depth.to_bits();
+                            }
+                        }
+                        let staging = upload(&rows)?;
+                        let src = D3D12_TEXTURE_COPY_LOCATION {
+                            pResource: std::mem::transmute_copy(&staging),
+                            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                                PlacedFootprint: layout,
+                            },
+                        };
+                        list.CopyTextureRegion(&subresource(&tex), 0, 0, 0, &src, None);
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_FLOAT,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2D: D3D12_TEX2D_SRV {
+                                    MipLevels: 1,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateShaderResourceView(&tex, Some(&srv), at);
+                        keep.push(staging);
                         keep.push(tex);
                     }
                     View::RawUav(_) | View::HalfUav(_) => {

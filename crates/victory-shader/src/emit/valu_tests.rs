@@ -1127,13 +1127,8 @@ fn image_gather4_c_lz_and_offset_match_rdna2() {
         "1D comparison gather must be rejected",
     );
 
-    let mut texels = [[0.0f32; 4]; 16];
-    for y in 0..4usize {
-        for x in 0..4usize {
-            let v = (y * 4 + x) as f32;
-            texels[y * 4 + x] = [v, 0.0, 0.0, 1.0];
-        }
-    }
+    // Comparison gather is supported on R32_FLOAT. Each depth is its texel index.
+    let depths: [f32; 16] = std::array::from_fn(|i| i as f32);
     let cmp_sampler = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -1144,7 +1139,7 @@ fn image_gather4_c_lz_and_offset_match_rdna2() {
         MaxLOD: f32::MAX,
         ..Default::default()
     }];
-    let views = [View::Texture(4, 4, &texels), View::RawUav(4)];
+    let views = [View::Depth(4, 4, &depths), View::RawUav(4)];
 
     fn run_gather(
         shader: &HostShader,
