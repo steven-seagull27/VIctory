@@ -1199,7 +1199,9 @@ fn image_gather4_c_lz_and_offset_match_d3d12() {
     let gather_g = build_sample_cs(&mimg_sample(0x04f, 0x2, 1, 8, 1, 16, 12));
     {
         let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-        let host = Host::new(true).expect("WARP host");
+        let host = Host::new(false)
+            .or_else(|_| Host::new(true))
+            .expect("an SM 6.6 device for the green gather pipeline");
         host.compute_pipeline(&gather_g)
             .expect("compute_pipeline for green gather4_c_lz");
     }
@@ -1451,7 +1453,9 @@ fn image_sample_offset_variants_match_d3d12() {
         }
         let vs = stub_vs(&ps).expect("stub_vs");
         let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-        let host = Host::new(true).expect("WARP host");
+        let host = Host::new(false)
+            .or_else(|_| Host::new(true))
+            .expect("an SM 6.6 device for the sample-offset graphics pipeline");
         host.pipeline(&vs, &ps)
             .unwrap_or_else(|e| panic!("graphics PSO failed for op {op:#x}: {e}"));
     }
