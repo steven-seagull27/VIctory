@@ -10738,7 +10738,7 @@ mod tests {
         // the fix, the zero-extending arm gives 0x00000000_ffffff9c.
         // VOP3B: opcode 0x177, vdst=0, sdst=0x6A (VCC).
         lowers_valu(&[
-            0xD577_006A,
+            0xD577_6A00,
             0x03FD_0080,
             0xFFFF_FF9C, // literal -100
         ])

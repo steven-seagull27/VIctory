@@ -170,6 +170,44 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
     Ok(shader)
 }
 
+/// Read both result VGPRs. The same 32-bit literal contributes different
+/// high dwords to signed and unsigned 64-bit adds when bit 31 is set.
+#[test]
+fn mad_64bit_literal_addends_match_signed_and_unsigned_arithmetic() {
+    let inputs = [
+        [0, 0, 0, 0],
+        [7, 13, 0, 0],
+        [65536, 65536, 0, 0],
+        [(-3i32) as u32, 5, 0, 0],
+    ];
+    for (op, signed) in [(0x176, false), (0x177, true)] {
+        for literal in [0xffff_ff9cu32, 0x8000_0000, 0x7fff_ffff, 13] {
+            for half in 0..2 {
+                // v_mad_{u64_u32,i64_i32} v[6:7], vcc, v1, v2, literal
+                let [word, sources] = vop3(op, 6, vgpr(1), vgpr(2), 255);
+                let shader = build_valu_cs(&[
+                    word | (106 << 8),
+                    sources,
+                    literal,
+                    vop1(1, 0, vgpr(6 + half)),
+                ]);
+                run_cases(&shader, &inputs, |adapter, _, [a, b, _, _], actual| {
+                    let result = if signed {
+                        ((a as i32 as i64) * (b as i32 as i64) + literal as i32 as i64) as u64
+                    } else {
+                        u64::from(a) * u64::from(b) + u64::from(literal)
+                    };
+                    let expected = (result >> (32 * half)) as u32;
+                    assert_eq!(
+                        actual, expected,
+                        "{adapter}: signed={signed} literal={literal:#010x} a={a:#x} b={b:#x} half={half}"
+                    );
+                });
+            }
+        }
+    }
+}
+
 /// One GPU test at a time. With these tests on the hardware adapter and WARP
 /// from several test threads at once, now and then none of their dispatches
 /// ever completes and the test binary hangs; and two GPU tests at once on
