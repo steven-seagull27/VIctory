@@ -28,7 +28,7 @@ fn tools() -> Option<(PathBuf, PathBuf)> {
     (console.exists() && pc.exists()).then_some((console, pc))
 }
 
-fn compile(
+pub(super) fn compile(
     dxc: &Path,
     dir: &Path,
     text: &str,

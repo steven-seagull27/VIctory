@@ -2,9 +2,10 @@
 //! translated, against the same HLSL compiled for PC, both drawn (or
 //! dispatched) on the host GPU with the same inputs.
 //!
-//! Needs `VICTORY_CONSOLE_DXC` (the console SDK's `dxc.exe`) and a PC
-//! `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's); skipped
-//! without them. Set `VICTORY_WARP=1` to draw on WARP.
+//! The native reference test needs a PC `dxc.exe` (`VICTORY_PC_DXC`, else
+//! the newest Windows SDK's). The differential tests also need
+//! `VICTORY_CONSOLE_DXC` (the console SDK's `dxc.exe`). Set `VICTORY_WARP=1`
+//! to run on WARP.
 
 use std::path::{Path, PathBuf};
 
@@ -748,13 +749,18 @@ const MS_CASES: &[(&str, u32, &str)] = &[
     ),
 ];
 
-fn tools() -> Option<(PathBuf, PathBuf)> {
-    let console = PathBuf::from(std::env::var_os("VICTORY_CONSOLE_DXC")?);
+fn pc_compiler() -> Option<PathBuf> {
     let pc = match std::env::var_os("VICTORY_PC_DXC") {
         Some(p) => PathBuf::from(p),
         None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
     };
-    (console.exists() && pc.exists()).then_some((console, pc))
+    pc.is_file().then_some(pc)
+}
+
+fn tools() -> Option<(PathBuf, PathBuf)> {
+    let console = PathBuf::from(std::env::var_os("VICTORY_CONSOLE_DXC")?);
+    let pc = pc_compiler()?;
+    console.is_file().then_some((console, pc))
 }
 
 fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec<u8> {
@@ -1332,6 +1338,79 @@ fn close(a: u32, b: u32) -> bool {
     a == b
         || x == 0.0 && y == 0.0
         || x.is_normal() && y.is_normal() && (x - y).abs() <= 1e-3 * y.abs().max(1.0)
+}
+
+/// The PC reference reads structured records through the descriptor's stride.
+#[test]
+fn native_pc_reads_structured_records() {
+    use super::host::{Dispatch, Stride, View};
+    let Some(pc) = pc_compiler() else {
+        eprintln!("no PC compiler; skipped");
+        return;
+    };
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
+    };
+    let source = r#"
+        StructuredBuffer<uint4> records : register(t0);
+        RWByteAddressBuffer output : register(u0);
+        [RootSignature("DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0))")]
+        [numthreads(32, 1, 1)]
+        void read_records(uint lane : SV_GroupIndex) {
+            if (lane == 0) {
+                uint count, stride;
+                records.GetDimensions(count, stride);
+                output.Store2(0, uint2(count, stride));
+            }
+            output.Store(8 + 4 * lane, records[lane].y);
+        }
+    "#;
+    let dir = std::env::temp_dir().join(format!("victory-native-srv-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let compiled = super::flow_tests::compile(&pc, &dir, source, "read_records", "cs_6_0");
+    let _ = std::fs::remove_file(dir.join("read_records.hlsl"));
+    let _ = std::fs::remove_file(dir.join("read_records.bin"));
+    let _ = std::fs::remove_dir(&dir);
+    let dxil = compiled.expect("compile the native PC structured-buffer reference");
+    // SAFETY: the DXC container carries the shader's root signature.
+    let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, &dxil) }.unwrap();
+    let pso = host.compute_pipeline_with(&root, &dxil).unwrap();
+    let data: Vec<u32> = (0..32)
+        .flat_map(|i| [100 + i, 200 + i, 300 + i, 400 + i])
+        .collect();
+    let table = |index| Root::Table {
+        sampler: false,
+        index,
+    };
+    let output = host
+        .dispatch_pc(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, table(0)), (1, table(1))],
+                views: &[
+                    View::Buffer {
+                        data: &data,
+                        stride: Stride::Structured(16),
+                    },
+                    View::RawUav(34),
+                ],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap();
+    assert_eq!(&output[0][..2], &[32, 16], "record count and byte stride");
+    assert_eq!(
+        &output[0][2..],
+        (200..232).collect::<Vec<_>>(),
+        "second word of each record"
+    );
+    eprintln!("native PC readback matched 32 records with a 16-byte stride");
 }
 
 #[test]
