@@ -1434,17 +1434,17 @@ fn comparison_gathers_return_their_four_comparisons() {
         (4, ResourceType::Uav, 8, 4),
         (6, ResourceType::Sampler, 0, 4),
     ];
-    let program = |offset: bool, reference: f32| {
+    let program = |offset: Option<u32>, reference: f32| {
         let mut w = prefix.clone();
         // The address dwords: offset (only `_o`), reference, x, y.
-        if offset {
-            w.push(vop1(0x001, 1, 128)); // v_mov_b32 v1, 0: no texel offset
+        if let Some(packed_offset) = offset {
+            w.extend([vop1(0x001, 1, 255), packed_offset]);
         }
-        let first = if offset { 2 } else { 1 };
+        let first = if offset.is_some() { 2 } else { 1 };
         for (reg, value) in [(first, reference), (first + 1, 0.4), (first + 2, 0.7)] {
             w.extend([vop1(0x001, reg, 255), value.to_bits()]);
         }
-        let op = if offset { 0x05f } else { 0x04f };
+        let op = if offset.is_some() { 0x05f } else { 0x04f };
         w.extend_from_slice(&mimg_sample(op, 0x1, 1, 13, 1, 8, 16));
         for k in 0..4u8 {
             w.extend(buffer_store_dword(13 + k, 20, 4 * u16::from(k)));
@@ -1465,8 +1465,8 @@ fn comparison_gathers_return_their_four_comparisons() {
         MaxLOD: f32::MAX,
         ..Default::default()
     }];
-    let texels: Vec<[f32; 4]> = (0..16).map(|i| [i as f32, 0.0, 0.0, 1.0]).collect();
-    let views = [View::Texture(4, 4, &texels), View::RawUav(4)];
+    let depths: Vec<f32> = (0..16).map(|i| i as f32).collect();
+    let views = [View::Depth(4, 4, &depths), View::RawUav(4)];
     let reference = 13.5f32;
     let want = |at: [(i32, i32); 4]| -> Vec<f32> {
         at.iter()
@@ -1480,13 +1480,12 @@ fn comparison_gathers_return_their_four_comparisons() {
             })
             .collect()
     };
+    let base = [(1, 3), (2, 3), (2, 2), (1, 2)];
     let cases = [
+        (program(None, reference), want(base)),
+        (program(Some(0), reference), want(base)),
         (
-            program(false, reference),
-            want([(1, 3), (2, 3), (2, 2), (1, 2)]),
-        ),
-        (
-            program(true, reference),
+            program(Some(1), reference),
             want([(2, 3), (3, 3), (3, 2), (2, 2)]),
         ),
     ];
@@ -1497,14 +1496,7 @@ fn comparison_gathers_return_their_four_comparisons() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        for (case, (shader, want)) in cases.iter().enumerate() {
-            if warp && case == 1 {
-                // WARP reads the offset gather's footprint a texel over (the
-                // same deviation `synthetic_tests` records for its gathers);
-                // the hardware is the reference for the offset form.
-                eprintln!("{label}: gather offset footprint differs on WARP; skipped");
-                continue;
-            }
+        for (shader, want) in &cases {
             let (root, pso) = host
                 .compute_pipeline(shader)
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
