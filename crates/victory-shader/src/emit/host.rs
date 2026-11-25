@@ -1282,6 +1282,27 @@ pub struct Dispatch<'a> {
 
 #[cfg(test)]
 impl Host {
+    /// Largest shader-visible CBV/SRV/UAV descriptor heap the device creates,
+    /// up to [`super::HEAP_VIEWS`].
+    pub(crate) fn max_views(&self) -> u32 {
+        for n in [super::HEAP_VIEWS, 1 << 20, 1_000_000] {
+            // SAFETY: querying device heap limit with a temporary heap.
+            let ok = unsafe {
+                self.device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: n,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                })
+            }
+            .is_ok();
+            if ok {
+                return n;
+            }
+        }
+        1_000_000
+    }
+
     /// Runs a compute pipeline and returns each UAV's contents in heap
     /// order (texels as float bits, row by row).
     pub fn dispatch(
@@ -1403,7 +1424,7 @@ impl Host {
                 Ok(b)
             };
             let slots = match d.views.last() {
-                Some(View::NullBuffers) => super::HEAP_VIEWS as usize,
+                Some(View::NullBuffers) => super::host_heap_views() as usize,
                 _ => d.views.len(),
             };
             let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots)?;
@@ -1733,7 +1754,7 @@ impl Host {
                     }
                     View::Pair => {}
                     View::NullBuffers => {
-                        let null = super::NULL_BUFFER_VIEW as usize;
+                        let null = super::null_buffer_view() as usize;
                         let (mut srv_at, mut uav_at) = (at, at);
                         srv_at.ptr += (null - i) * view_size;
                         uav_at.ptr += (null - 1 - i) * view_size;

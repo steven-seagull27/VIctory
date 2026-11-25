@@ -520,7 +520,11 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self.m.i32(if sampler {
+            HEAP_SAMPLERS
+        } else {
+            super::host_heap_views()
+        } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));

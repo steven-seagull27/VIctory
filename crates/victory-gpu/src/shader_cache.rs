@@ -64,30 +64,37 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        let heap_views = crate::host::host_heap_views();
+        victory_shader::emit::set_host_heap_views(heap_views);
+        key(victory_shader::SOURCE_HASH, ENCODING, limit, heap_views)
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, heap_views: u32) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    if heap_views != victory_shader::emit::HEAP_VIEWS {
+        h.update(&heap_views.to_le_bytes());
+    }
     *h.finalize().as_bytes()
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+    // Settles the translation settings (the host's heap limit) first.
+    let build = build();
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     let options = victory_shader::emit::Options { view_marks: true };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, build, container, translate),
         None => (translate(container), false),
     }
 }
@@ -435,17 +442,19 @@ mod tests {
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, victory_shader::emit::HEAP_VIEWS);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, victory_shader::emit::HEAP_VIEWS));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, victory_shader::emit::HEAP_VIEWS));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, victory_shader::emit::HEAP_VIEWS));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, victory_shader::emit::HEAP_VIEWS));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, 1_000_000));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                crate::host::host_heap_views(),
             )
         );
         // The encoding part is this file as built.

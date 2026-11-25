@@ -350,6 +350,28 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// View descriptor slots in the host's heap (indices above this are clamped
+/// to the last slot, and null buffer views sit at [`null_buffer_view`]).
+static HOST_HEAP_VIEWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(HEAP_VIEWS);
+
+/// Sets the host's view descriptor heap size (clamped to at least 4); call
+/// before translating when the host caps heaps below [`HEAP_VIEWS`].
+pub fn set_host_heap_views(views: u32) {
+    HOST_HEAP_VIEWS.store(views.max(4), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The host's view descriptor heap size used for index clamping and null
+/// buffer view indices.
+pub fn host_heap_views() -> u32 {
+    HOST_HEAP_VIEWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The null raw buffer SRV index (UAV sits one slot below) for the active
+/// [`host_heap_views`].
+pub fn null_buffer_view() -> u32 {
+    host_heap_views() - 2
+}
+
 /// How a translation is made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Options {

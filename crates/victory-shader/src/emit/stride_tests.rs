@@ -304,6 +304,20 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
 /// indices"): a texture descriptor read as a buffer one is a wild address.
 #[test]
 fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let prev = super::host_heap_views();
+    if let Ok(hw) = Host::new(false) {
+        super::set_host_heap_views(hw.max_views());
+    }
+    struct Restore(u32);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::set_host_heap_views(self.0);
+        }
+    }
+    let _restore = Restore(prev);
     let shader = build(
         HEAP_ELEMENT_WAVE32,
         vec![
@@ -316,9 +330,6 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
     );
     let texel = [[1.0f32, 2.0, 3.0, 4.0]];
     let views = [View::RawUav(32), View::Texture(1, 1, &texel), View::NullBuffers];
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {

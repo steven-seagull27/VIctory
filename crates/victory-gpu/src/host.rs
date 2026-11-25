@@ -137,6 +137,38 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// Largest shader-visible CBV/SRV/UAV descriptor heap the host accepts, up to
+/// [`victory_shader::emit::HEAP_VIEWS`]. NVIDIA caps shader-visible heaps at
+/// `1_000_000` (Tier 2/3 limit). Logged once.
+pub(crate) fn host_heap_views() -> u32 {
+    static VIEWS: OnceLock<u32> = OnceLock::new();
+    *VIEWS.get_or_init(|| {
+        let Some(host) = host() else {
+            return victory_shader::emit::HEAP_VIEWS;
+        };
+        for n in [victory_shader::emit::HEAP_VIEWS, 1 << 20, 1_000_000] {
+            // SAFETY: temporary descriptor heap query; released on drop.
+            let ok = unsafe {
+                host.device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(
+                    &D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: n,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    },
+                )
+            }
+            .is_ok();
+            if ok {
+                tracing::info!(views = n, "host view descriptor heap limit");
+                return n;
+            }
+        }
+        tracing::warn!("descriptor heap query failed for all sizes; assuming 1_000_000");
+        1_000_000
+    })
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
