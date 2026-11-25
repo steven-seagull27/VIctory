@@ -832,6 +832,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
+    #[cfg(windows)]
+    mod buffer_data;
+
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
     #[repr(C)]
