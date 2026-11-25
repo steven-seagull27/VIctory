@@ -1299,3 +1299,45 @@ fn vcc_from_a_divergent_scalar_join_is_refused() {
         what: "a scalar VCC branch depending on a divergent scalar join", ..
     })));
 }
+
+/// Non-compute stages where the guest wave width cannot be established keep
+/// the per-lane decision for `v_cmp; s_and vcc, exec, vcc; s_cbranch_vcc*`
+/// rather than refusing to translate.
+#[test]
+fn pixel_shader_vcc_branch_uses_per_lane_decision() {
+    for branch in [
+        0xBF86_0001u32, // s_cbranch_vccz +1
+        0xBF87_0001u32, // s_cbranch_vccnz +1
+    ] {
+        let code = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0x87EA_6A7E, // s_and_b64 vcc, exec, vcc
+            branch,
+            0x7E04_02F2, // v_mov_b32 v2, 1.0
+            0xF800_1890,
+            0x0000_0000, // exp null off, off, off, off done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: true,
+            vgprs: 4,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Ps {
+                inputs: Vec::new(),
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+            code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let l = lowered(&native).expect("pixel shader with VCC branch should translate");
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut l.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+    }
+}

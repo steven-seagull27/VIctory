@@ -2587,6 +2587,19 @@ impl<'a> Lower<'a> {
                 Val::Missing(w) => Err(w),
             },
             Atom::VccNonzero(lo, hi) => {
+                // Stages without an established guest wave width (pixel,
+                // vertex, mesh) keep the per-lane decision for lane-mask VCC
+                // values so compiler patterns like `v_cmp; s_and vcc, exec,
+                // vcc; s_cbranch_vccz` continue to translate.
+                let singleton =
+                    matches!(&self.x.native.io, StageIo::Cs(cs) if cs.threads == [1, 1, 1]);
+                let has_wave_width = self.mask_data == MaskData::Console
+                    && (singleton || self.s.wave_size.is_some());
+                if !has_wave_width
+                    && let Some(mask) = self.x.st.mask_bits(lo, (lo != hi).then_some(hi))
+                {
+                    return self.boolean(mask, at);
+                }
                 self.check_vcc_joins(lo, hi)?;
                 let low = self.vcc_word(lo)?;
                 let bits = if hi == lo {
