@@ -167,9 +167,19 @@ fn build(
     used: Vec<UsedResource>,
     threads: u32,
 ) -> HostShader {
+    build_wave(words, layout, used, threads, false)
+}
+
+fn build_wave(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    threads: u32,
+    wave64: bool,
+) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 8,
         layout,
         used,
@@ -223,6 +233,132 @@ fn build(
         eprintln!("no dxil.dll; validation skipped");
     }
     shader
+}
+
+/// Lanes 1 and 2 exchange their source values. Lane 0 is disabled and
+/// keeps its destination. Read lanes 0..3 before restoring EXEC so both
+/// the inactive destination and the nonidentity permutation reach the UAV.
+#[test]
+fn narrowed_exec_dpp_reads_a_lane_and_preserves_inactive_destinations() {
+    check_narrowed_exec_dpp(false);
+}
+
+/// With invocation IDs as the source, each fixed-lane read must still
+/// broadcast one value to every writer after EXEC is restored.
+#[test]
+fn narrowed_exec_dpp_reads_the_selected_lanes_invocation_id() {
+    check_narrowed_exec_dpp(true);
+}
+
+fn check_narrowed_exec_dpp(lane_varying: bool) {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut bad = 0;
+    for (wave64, save, mov, threads) in [(false, 0x3d, 3, 32), (true, 0x25, 4, 64)] {
+        let sop = |dst: u32, op: u32, src: u32| 0xbe80_0000 | dst << 16 | op << 8 | src;
+        let mut words = vec![
+            0xbe8c_0302,
+            0xbe8d_0380,
+            0xf408_0406,
+            0xfa00_0000,       // UAV at s2
+            sop(8, save, 193), // s_or_saveexec s8, -1
+            if lane_varying {
+                0x7e02_0300
+            } else {
+                0x7e02_0200
+            }, // v_mov_b32 v1, v0 (lane) or s0
+            0x7e04_02a5,       // v_mov_b32 v2, 37
+            sop(126, mov, 130), // EXEC = 2: only lane 1
+            0x7e02_0201,       // v_mov_b32 v1, s1
+            sop(126, mov, 194), // EXEC = -2: all except lane 0
+            0x7e04_02fa,
+            0xff00_d801, // v_mov_b32 v2, v1 quad_perm:[0,2,1,3]
+        ];
+        for lane in 0..4 {
+            // v_readlane_b32 s[20 + lane], v2, lane
+            words.extend([0xd760_0014 + lane, 258 | (128 + lane) << 9]);
+        }
+        words.extend([sop(126, mov, 8), 0x3408_0084]); // restore EXEC; v4 = 16 * lane
+        for lane in 0..4 {
+            // v_mov_b32 v3, s[20 + lane]; buffer_store_dword v3, v4, s[16:19], offset:4*lane
+            words.extend([0x7e06_0214 + lane, 0xe070_1000 + lane * 4, 0x8004_0304]);
+        }
+        words.push(0xbf81_0000);
+        let shader = build_wave(
+            &words,
+            vec![
+                param(RootType::Constants, 0),
+                param(RootType::Constants, 1),
+                param(RootType::Table, 2),
+            ],
+            vec![entry(ResourceType::Uav, 4, 2)],
+            threads,
+            wave64,
+        );
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else { continue };
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+            };
+            let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the buffer matches OPTIONS1 and lives through the call.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut caps).cast(),
+                    std::mem::size_of_val(&caps) as u32,
+                )
+            }
+            .expect("D3D12 wave options");
+            if !caps.WaveOps.as_bool()
+                || !(caps.WaveLaneCountMin..=caps.WaveLaneCountMax).contains(&threads)
+            {
+                eprintln!(
+                    "{label}: skipped wave{threads} (device range {}..{})",
+                    caps.WaveLaneCountMin, caps.WaveLaneCountMax
+                );
+                continue;
+            }
+            let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+            for (base, special) in [(11, 19), (0x1234_5678, 0x8765_4321)] {
+                let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    ud[u.index as usize] = match (u.root, u.slot) {
+                        (RootType::Constants, 0) => base,
+                        (RootType::Constants, 1) => special,
+                        (RootType::Table, 2) => 0,
+                        other => panic!("unexpected user data {other:?}"),
+                    };
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[View::RawUav(4 * threads)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .expect("readback");
+                let expected = if lane_varying {
+                    [37, 2, special, 3]
+                } else {
+                    [37, base, special, base]
+                };
+                assert_eq!(out[0].len(), 4 * threads as usize);
+                let mismatches = out[0].chunks_exact(4).filter(|x| *x != expected).count();
+                bad += mismatches;
+                eprintln!(
+                    "{label}: wave{threads}, {mismatches}/{threads} mismatched records; expected {expected:?}; first two {:?}",
+                    &out[0][..8]
+                );
+            }
+        }
+    }
+    assert_eq!(bad, 0, "fixed-lane scalar reads after DPP");
 }
 
 #[test]
