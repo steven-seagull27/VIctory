@@ -196,8 +196,8 @@ pub fn track(
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 if let Source::Loaded { load, .. } = source
-                    && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
-                    && let Some(Term::Value(v)) = a.dynamic.map(|d| t.origin(d))
+                    && let Ok(idx) = out.scalar.binary_search_by_key(&load, |s| s.0)
+                    && let Some(Term::Value(v)) = out.scalar[idx].1.dynamic.map(|d| t.origin(d))
                     && t.first_lane_source(v).is_some()
                 {
                     offset.push((v, load));
@@ -316,16 +316,22 @@ struct Sum {
     dynamic: Option<Value>,
 }
 
+/// Compact per-value definition site (every SSA value is an input, a phi,
+/// or an instruction write — never more than one).
+#[derive(Clone, Copy)]
+enum Def {
+    None,
+    Input(Reg),
+    Phi(u32, u32),
+    Inst(u32, u32),
+}
+
 struct Tracer<'a> {
     p: &'a Program,
     layout: &'a [RootParam],
     stage: HwStage,
-    /// Defining instruction per value (phis and inputs have none).
-    defs: Vec<Option<Site>>,
-    /// Block and index of each phi value.
-    phis: Vec<Option<(usize, usize)>>,
-    /// Register per input value.
-    inputs: Vec<Option<Reg>>,
+    /// Defining input, phi, or instruction per value.
+    defs: Vec<Def>,
     origin: Vec<Term>,
     lanes: Option<&'a Structured>,
     /// Reverse-postorder index per block.
@@ -363,19 +369,31 @@ fn meet(lanes: &Structured, known: &Known) -> bool {
 
 /// Whether `b` is a small condition: at most 4 atoms within 32 nodes.
 fn few_atoms(bools: &crate::structure::Bools, b: Bool) -> bool {
-    let (mut atoms, mut stack, mut nodes) = (Vec::new(), vec![b], 0);
-    while let Some(x) = stack.pop() {
-        let Some((atom, lo, hi)) = bools.node(x) else {
+    let mut atoms = [None; 4];
+    let mut n_atoms = 0usize;
+    let mut stack = [Bool::FALSE; 65];
+    let mut top = 1usize;
+    stack[0] = b;
+    let mut nodes = 0usize;
+    while top > 0 {
+        top -= 1;
+        let Some((atom, lo, hi)) = bools.node(stack[top]) else {
             continue;
         };
         nodes += 1;
-        if !atoms.contains(&atom) {
-            atoms.push(atom);
-        }
-        if nodes > 32 || atoms.len() > 4 {
+        if nodes > 32 {
             return false;
         }
-        stack.extend([lo, hi]);
+        if !atoms[..n_atoms].contains(&Some(atom)) {
+            if n_atoms == 4 {
+                return false;
+            }
+            atoms[n_atoms] = Some(atom);
+            n_atoms += 1;
+        }
+        stack[top] = lo;
+        stack[top + 1] = hi;
+        top += 2;
     }
     true
 }
@@ -402,36 +420,30 @@ impl<'a> Tracer<'a> {
                 }))
         };
         let n = all().map(|v| v.0 as usize + 1).max().unwrap_or(0);
-        let mut defs = vec![None; n];
-        let mut phis = vec![None; n];
-        let mut inputs = vec![None; n];
+        let mut defs = vec![Def::None; n];
         for &(reg, v) in &p.inputs {
-            inputs[v.0 as usize] = Some(reg);
+            defs[v.0 as usize] = Def::Input(reg);
         }
         for (b, block) in p.blocks.iter().enumerate() {
             for (i, phi) in block.phis.iter().enumerate() {
-                phis[phi.value.0 as usize] = Some((b, i));
+                defs[phi.value.0 as usize] = Def::Phi(b as u32, i as u32);
             }
             for (i, inst) in block.insts.iter().enumerate() {
                 for &(_, v) in &inst.writes {
-                    defs[v.0 as usize] = Some((b, i));
+                    defs[v.0 as usize] = Def::Inst(b as u32, i as u32);
                 }
             }
         }
+        let order = crate::ir::reverse_postorder(&p.blocks);
         let mut rpo = vec![usize::MAX; p.blocks.len()];
-        for (n, b) in crate::ir::reverse_postorder(&p.blocks)
-            .into_iter()
-            .enumerate()
-        {
-            rpo[b] = n;
+        for (idx, &b) in order.iter().enumerate() {
+            rpo[b] = idx;
         }
         let mut t = Tracer {
             p,
             layout,
             stage,
             defs,
-            phis,
-            inputs,
             origin: Vec::new(),
             lanes,
             rpo,
@@ -440,7 +452,7 @@ impl<'a> Tracer<'a> {
             spill_at: Default::default(),
             sums: Default::default(),
         };
-        t.origin = t.propagate_copies(n)?;
+        t.origin = t.propagate_copies(n, &order)?;
         // Loads from the root signature's memory are found by their address,
         // which copies reach; then a reload is a copy of the first load.
         for (site, at) in t.spill_loads() {
@@ -454,11 +466,35 @@ impl<'a> Tracer<'a> {
             }
         }
         if !t.spilled.is_empty() {
-            t.origin = t.propagate_copies(n)?;
+            t.origin = t.propagate_copies(n, &order)?;
             // Sums traced to find them are older than these origins.
             t.sums.take();
         }
         Ok(t)
+    }
+
+    #[inline]
+    fn def_site(&self, v: Value) -> Option<Site> {
+        match self.defs[v.0 as usize] {
+            Def::Inst(b, i) => Some((b as usize, i as usize)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn phi_of(&self, v: Value) -> Option<(usize, usize)> {
+        match self.defs[v.0 as usize] {
+            Def::Phi(b, i) => Some((b as usize, i as usize)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn input_of(&self, v: Value) -> Option<Reg> {
+        match self.defs[v.0 as usize] {
+            Def::Input(reg) => Some(reg),
+            _ => None,
+        }
     }
 
     /// The scalar loads from the root signature's memory ([`USER_DATA`])
@@ -524,7 +560,7 @@ impl<'a> Tracer<'a> {
     /// The root parameter and dword `v` holds on entry or loaded from the
     /// root signature's memory.
     fn param_value(&self, v: Value) -> Option<(usize, u32)> {
-        match self.inputs[v.0 as usize] {
+        match self.input_of(v) {
             Some(reg) => self.param_of(reg),
             None => self.spilled.get(&v).copied(),
         }
@@ -541,60 +577,120 @@ impl<'a> Tracer<'a> {
 
     /// Optimistic copy propagation: a move's result is its source's
     /// origin, a phi's the one origin its arguments agree on.
-    fn propagate_copies(&self, n: usize) -> Result<Vec<Term>, ShaderError> {
+    ///
+    /// Round 0 settles every non-copy and constant write once in reverse
+    /// postorder while collecting only phis and value-copy edges into `work`.
+    /// When no phi argument or copy source observes an unresolved (`None`)
+    /// origin on round 0, every dependency is strictly forward in RPO and the
+    /// result has already converged in one pass.
+    fn propagate_copies(&self, n: usize, order: &[usize]) -> Result<Vec<Term>, ShaderError> {
+        enum Work {
+            Phi(u32, u32),
+            Copy { dst: Value, src: Value },
+        }
         let mut o: Vec<Option<Term>> = vec![None; n];
         for &(_, v) in &self.p.inputs {
             o[v.0 as usize] = Some(Term::Value(v));
         }
-        let order = crate::ir::reverse_postorder(&self.p.blocks);
-        for _ in 0..MAX_ROUNDS {
-            let mut changed = false;
-            for &b in &order {
-                let block = &self.p.blocks[b];
-                for phi in &block.phis {
-                    let own = Term::Value(phi.value);
-                    let mut args = phi
-                        .args
-                        .iter()
-                        .filter_map(|a| o[a.0 as usize])
-                        .filter(|&t| t != own);
-                    let new = args
-                        .next()
-                        .map(|first| if args.all(|t| t == first) { first } else { own });
-                    if new.is_some() && new != o[phi.value.0 as usize] {
-                        o[phi.value.0 as usize] = new;
-                        changed = true;
+        let has_spilled = !self.spilled.is_empty();
+        let mut work: Vec<Work> = Vec::new();
+        let mut saw_none = false;
+
+        for &b in order {
+            let block = &self.p.blocks[b];
+            for (pi, phi) in block.phis.iter().enumerate() {
+                work.push(Work::Phi(b as u32, pi as u32));
+                let own = Term::Value(phi.value);
+                let mut first: Option<Term> = None;
+                let mut uniform = true;
+                for &a in &phi.args {
+                    let Some(t) = o[a.0 as usize] else {
+                        saw_none = true;
+                        continue;
+                    };
+                    if t == own {
+                        continue;
+                    }
+                    match first {
+                        None => first = Some(t),
+                        Some(f) if f != t => uniform = false,
+                        _ => {}
                     }
                 }
-                for inst in &block.insts {
-                    for (k, &(_, v)) in inst.writes.iter().enumerate() {
-                        let reload = self
-                            .spilled
+                if let Some(f) = first {
+                    o[phi.value.0 as usize] = Some(if uniform { f } else { own });
+                }
+            }
+            for inst in &block.insts {
+                for (k, &(_, v)) in inst.writes.iter().enumerate() {
+                    let reload = if has_spilled {
+                        self.spilled
                             .get(&v)
                             .map(|pd| self.first_spilled[pd])
                             .filter(|&first| first != v)
-                            .map(Moved::Value);
-                        let new = match reload
-                            .or_else(|| copy_source(inst, k))
-                            .or_else(|| self.restored(inst))
-                        {
-                            Some(Moved::Const(c)) => Some(Term::Const(c)),
-                            Some(Moved::Value(s)) => o[s.0 as usize],
-                            None => Some(Term::Value(v)),
-                        };
-                        if new.is_some() && new != o[v.0 as usize] {
-                            o[v.0 as usize] = new;
+                            .map(Moved::Value)
+                    } else {
+                        None
+                    };
+                    match reload
+                        .or_else(|| copy_source(inst, k))
+                        .or_else(|| self.restored(inst))
+                    {
+                        Some(Moved::Const(c)) => o[v.0 as usize] = Some(Term::Const(c)),
+                        Some(Moved::Value(s)) => {
+                            work.push(Work::Copy { dst: v, src: s });
+                            match o[s.0 as usize] {
+                                Some(t) => o[v.0 as usize] = Some(t),
+                                None => saw_none = true,
+                            }
+                        }
+                        None => o[v.0 as usize] = Some(Term::Value(v)),
+                    }
+                }
+            }
+        }
+
+        let finish = |o: Vec<Option<Term>>| -> Vec<Term> {
+            o.into_iter()
+                .enumerate()
+                .map(|(v, t)| t.unwrap_or(Term::Value(Value(v as u32))))
+                .collect()
+        };
+        if !saw_none {
+            return Ok(finish(o));
+        }
+
+        for _ in 1..MAX_ROUNDS {
+            let mut changed = false;
+            for item in &work {
+                match *item {
+                    Work::Phi(b, pi) => {
+                        let phi = &self.p.blocks[b as usize].phis[pi as usize];
+                        let own = Term::Value(phi.value);
+                        let mut args = phi
+                            .args
+                            .iter()
+                            .filter_map(|a| o[a.0 as usize])
+                            .filter(|&t| t != own);
+                        let new = args
+                            .next()
+                            .map(|first| if args.all(|t| t == first) { first } else { own });
+                        if new.is_some() && new != o[phi.value.0 as usize] {
+                            o[phi.value.0 as usize] = new;
+                            changed = true;
+                        }
+                    }
+                    Work::Copy { dst, src } => {
+                        let new = o[src.0 as usize];
+                        if new.is_some() && new != o[dst.0 as usize] {
+                            o[dst.0 as usize] = new;
                             changed = true;
                         }
                     }
                 }
             }
             if !changed {
-                return Ok(o
-                    .into_iter()
-                    .enumerate()
-                    .map(|(v, t)| t.unwrap_or(Term::Value(Value(v as u32))))
-                    .collect());
+                return Ok(finish(o));
             }
         }
         Err(ShaderError::Unsupported {
@@ -608,7 +704,7 @@ impl<'a> Tracer<'a> {
     }
 
     fn def(&self, v: Value) -> Option<&'a Inst> {
-        self.defs[v.0 as usize].map(|s| self.inst(s))
+        self.def_site(v).map(|s| self.inst(s))
     }
 
     fn origin(&self, v: Value) -> Term {
@@ -674,7 +770,7 @@ impl<'a> Tracer<'a> {
             offset: 0,
             dynamic: Some(v),
         };
-        if self.inputs[v.0 as usize].is_some() || self.spilled.contains_key(&v) {
+        if self.input_of(v).is_some() || self.spilled.contains_key(&v) {
             return match self.param_value(v) {
                 Some((p, 0)) if self.layout[p].root != RootType::Constants => Sum {
                     base: Some(v),
@@ -880,7 +976,7 @@ impl<'a> Tracer<'a> {
             if !seen.insert(v) || seen.len() > 256 {
                 continue;
             }
-            if let Some((b, i)) = self.phis[v.0 as usize] {
+            if let Some((b, i)) = self.phi_of(v) {
                 stack.extend(&self.p.blocks[b].phis[i].args);
                 continue;
             }
@@ -978,7 +1074,7 @@ impl<'a> Tracer<'a> {
     /// `indirect_light_probes:CS_Alpha_Schedule`'s table address).
     fn joined_on_taken_edges(&self, t: Term) -> Option<Term> {
         let Term::Value(v) = t else { return None };
-        let (b, i) = self.phis[v.0 as usize]?;
+        let (b, i) = self.phi_of(v)?;
         let block = &self.p.blocks[b];
         let mut taken = block.phis[i]
             .args
@@ -1019,7 +1115,7 @@ impl<'a> Tracer<'a> {
         if self.param_value(v).is_some() {
             return "an address from a root parameter that is no address";
         }
-        if self.inputs[v.0 as usize].is_some() {
+        if self.input_of(v).is_some() {
             return "an address in an SGPR that is no root parameter";
         }
         if self
@@ -1083,20 +1179,33 @@ impl<'a> Tracer<'a> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
-        let mut words = (0..dwords)
-            .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
-            .collect::<Option<Vec<_>>>()
-            .ok_or("a descriptor not in SGPRs")?;
+        let mut stack_words = [Term::Const(0); 8];
+        let mut heap_words;
+        let words: &mut [Term] = if usize::from(dwords) <= stack_words.len() {
+            for k in 0..dwords {
+                stack_words[usize::from(k)] = inst
+                    .read(Reg::S(code + k))
+                    .map(|v| self.origin(v))
+                    .ok_or("a descriptor not in SGPRs")?;
+            }
+            &mut stack_words[..usize::from(dwords)]
+        } else {
+            heap_words = (0..dwords)
+                .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
+                .collect::<Option<Vec<_>>>()
+                .ok_or("a descriptor not in SGPRs")?;
+            &mut heap_words
+        };
         // A byte access through a buffer descriptor made raw reads what the
         // descriptor's view does with a raw host view.
         if !inst.name().contains("format")
-            && let Some(raw) = self.made_raw(&words)
+            && let Some(raw) = self.made_raw(words)
         {
-            words = raw.to_vec();
+            words[..4].copy_from_slice(&raw);
         }
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
-        self.classify(&words, &mut Vec::new(), &mut known)
+        self.classify(words, &mut Vec::new(), &mut known)
     }
 
     /// The source of a descriptor's words; `joins` are the phi blocks
@@ -1181,7 +1290,7 @@ impl<'a> Tracer<'a> {
         known: &mut Known,
     ) -> Result<Option<Source>, &'static str> {
         let phi_of = |w: &Term| match *w {
-            Term::Value(v) => self.phis[v.0 as usize],
+            Term::Value(v) => self.phi_of(v),
             Term::Const(_) => None,
         };
         let Some((block, _)) = words.iter().find_map(phi_of) else {
@@ -1232,7 +1341,8 @@ impl<'a> Tracer<'a> {
         let Some(lanes) = self.lanes else {
             return true;
         };
-        let mut edge = vec![(lanes.reach[q], true)];
+        let mut edge = [(lanes.reach[q], true), (lanes.reach[q], true)];
+        let mut len = 1;
         if let LaneExit::Branch {
             when,
             taken,
@@ -1240,10 +1350,11 @@ impl<'a> Tracer<'a> {
         } = lanes.exits[q]
             && taken != not_taken
         {
-            edge.push((when, taken == b));
+            edge[1] = (when, taken == b);
+            len = 2;
         }
         // The very test lowering makes, so both drop the same edges.
-        lanes.bools.meet(&edge)
+        lanes.bools.meet(&edge[..len])
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
@@ -1254,13 +1365,26 @@ impl<'a> Tracer<'a> {
         joins: &mut Vec<usize>,
         known: &mut Known,
     ) -> Result<Option<Source>, &'static str> {
-        let picks: Vec<_> = words
-            .iter()
-            .map(|w| match *w {
-                Term::Value(v) => self.picked(v),
-                Term::Const(_) => None,
-            })
-            .collect();
+        let mut stack_picks = [None; 8];
+        let heap_picks: Vec<_>;
+        let picks: &[Option<(Value, Term, Term)>] = if words.len() <= stack_picks.len() {
+            for (slot, w) in stack_picks.iter_mut().zip(words) {
+                *slot = match *w {
+                    Term::Value(v) => self.picked(v),
+                    Term::Const(_) => None,
+                };
+            }
+            &stack_picks[..words.len()]
+        } else {
+            heap_picks = words
+                .iter()
+                .map(|w| match *w {
+                    Term::Value(v) => self.picked(v),
+                    Term::Const(_) => None,
+                })
+                .collect();
+            &heap_picks
+        };
         let Some(scc) = picks.iter().flatten().map(|p| p.0).next() else {
             return Ok(None);
         };
@@ -1276,7 +1400,7 @@ impl<'a> Tracer<'a> {
         let side = |set: bool| -> Vec<Term> {
             words
                 .iter()
-                .zip(&picks)
+                .zip(picks)
                 .map(|(w, p)| match p {
                     Some((_, t, f)) => {
                         if set {
@@ -1516,13 +1640,16 @@ impl<'a> Tracer<'a> {
     /// Whether `t` is a value each lane holds its own of (one in VGPRs).
     fn varies(&self, t: Term) -> bool {
         let Term::Value(v) = t else { return false };
-        let reg = match (self.inputs[v.0 as usize], self.phis[v.0 as usize]) {
-            (Some(reg), _) => Some(reg),
-            (None, Some((b, i))) => Some(self.p.blocks[b].phis[i].reg),
-            (None, None) => self
-                .def(v)
-                .and_then(|i| i.writes.iter().find(|w| w.1 == v))
+        let reg = match self.defs[v.0 as usize] {
+            Def::Input(reg) => Some(reg),
+            Def::Phi(b, i) => Some(self.p.blocks[b as usize].phis[i as usize].reg),
+            Def::Inst(b, i) => self
+                .inst((b as usize, i as usize))
+                .writes
+                .iter()
+                .find(|w| w.1 == v)
                 .map(|w| w.0),
+            Def::None => None,
         };
         matches!(reg, Some(Reg::V(_)))
     }
@@ -1537,7 +1664,7 @@ impl<'a> Tracer<'a> {
                 break;
             }
             if self.varies(t)
-                && let Some(site) = self.defs[v.0 as usize]
+                && let Some(site) = self.def_site(v)
             {
                 self.runs(site, known)?;
             }
@@ -1621,7 +1748,7 @@ impl<'a> Tracer<'a> {
         let Term::Value(v) = lane else { unreachable!() };
         let name = self.def(v).map(|i| i.name());
         Err(match name {
-            _ if self.inputs[v.0 as usize].is_some() => {
+            _ if self.input_of(v).is_some() => {
                 "a descriptor read from the first lane of an input VGPR"
             }
             None => "a descriptor read from the first lane of a phi",
@@ -1644,7 +1771,7 @@ impl<'a> Tracer<'a> {
     fn fetched(&self, words: &[Term], known: &Known) -> Result<Option<Source>, &'static str> {
         let at = |w: &Term| -> Option<(Site, usize)> {
             let Term::Value(v) = *w else { return None };
-            let site = self.defs[v.0 as usize]?;
+            let site = self.def_site(v)?;
             let inst = self.inst(site);
             if !inst.name().starts_with("global_load_dword") {
                 return None;
@@ -1713,7 +1840,7 @@ impl<'a> Tracer<'a> {
         }
         for (w, p) in words.iter().zip(&picks) {
             if let (Term::Value(v), Some(_)) = (*w, p)
-                && let Some(site) = self.defs[v.0 as usize]
+                && let Some(site) = self.def_site(v)
             {
                 self.runs(site, known)?;
             }
@@ -1797,7 +1924,7 @@ impl<'a> Tracer<'a> {
         known: &mut Known,
     ) -> Result<Option<Source>, &'static str> {
         let phi_of = |w: &Term| match *w {
-            Term::Value(v) => self.phis[v.0 as usize],
+            Term::Value(v) => self.phi_of(v),
             Term::Const(_) => None,
         };
         let Some((block, _)) = words.iter().find_map(phi_of) else {
@@ -1823,7 +1950,7 @@ impl<'a> Tracer<'a> {
         for w in words {
             if let Term::Value(v) = *w
                 && phi_of(w).is_none()
-                && let Some((d, _)) = self.defs[v.0 as usize]
+                && let Some((d, _)) = self.def_site(v)
                 && (d == block || self.reaches(block, d))
             {
                 return Err("a descriptor partly joined by control flow");
@@ -1927,7 +2054,7 @@ impl<'a> Tracer<'a> {
         // sampler) is not followed.
         if reads
             .iter()
-            .any(|v| self.defs[v.0 as usize].is_none_or(|at| at.0 != b))
+            .any(|v| self.def_site(*v).is_none_or(|at| at.0 != b))
         {
             return Err(SPLIT);
         }
@@ -1939,10 +2066,10 @@ impl<'a> Tracer<'a> {
             return Err(SELECT);
         }
         let retry = exec(exit).ok_or(RETRY)?;
-        let first = self.defs[reads[0].0 as usize].ok_or(LOOP)?;
+        let first = self.def_site(reads[0]).ok_or(LOOP)?;
         let remaining = exec(self.inst(first)).ok_or(SELECT)?;
         if reads.iter().any(|v| {
-            self.defs[v.0 as usize]
+            self.def_site(*v)
                 .is_none_or(|at| at.1 >= access || exec(self.inst(at)) != Some(remaining))
         }) {
             return Err(SELECT);
@@ -1983,7 +2110,7 @@ impl<'a> Tracer<'a> {
                             return None;
                         };
                         let lane = inst.read(Reg::V(reg + k))?;
-                        let (_, read) = self.defs[x.0 as usize]?;
+                        let (_, read) = self.def_site(x)?;
                         let same = reads.contains(&x)
                             && read < i
                             && self.lane_term(Term::Value(self.first_lane_source(x)?))
@@ -2044,7 +2171,7 @@ impl<'a> Tracer<'a> {
         let Term::Value(v0) = words[0] else {
             return None;
         };
-        let load = self.defs[v0.0 as usize]?;
+        let load = self.def_site(v0)?;
         let inst = self.inst(load);
         if !inst.name().starts_with("s_load_") {
             return None;
@@ -2089,7 +2216,7 @@ impl Tracer<'_> {
     /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
     /// `seen` (already being resolved), `Err` if not a spilled SGPR.
     fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Moved>, ()> {
-        if let Some((b, i)) = self.phis[v.0 as usize] {
+        if let Some((b, i)) = self.phi_of(v) {
             if seen.contains(&v) {
                 return Ok(None);
             }
@@ -3895,5 +4022,180 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn sparse_copy_propagation_matches_full_passes_on_acyclic_and_cyclic_cfg() {
+        // Reference full-pass copy propagation matching the original algorithm.
+        fn reference_origins(t: &Tracer<'_>) -> Vec<Term> {
+            let n = t.defs.len();
+            let mut o: Vec<Option<Term>> = vec![None; n];
+            for &(_, v) in &t.p.inputs {
+                o[v.0 as usize] = Some(Term::Value(v));
+            }
+            let order = crate::ir::reverse_postorder(&t.p.blocks);
+            for _ in 0..MAX_ROUNDS {
+                let mut changed = false;
+                for &b in &order {
+                    let block = &t.p.blocks[b];
+                    for phi in &block.phis {
+                        let own = Term::Value(phi.value);
+                        let mut args = phi
+                            .args
+                            .iter()
+                            .filter_map(|a| o[a.0 as usize])
+                            .filter(|&x| x != own);
+                        let new = args
+                            .next()
+                            .map(|first| if args.all(|x| x == first) { first } else { own });
+                        if new.is_some() && new != o[phi.value.0 as usize] {
+                            o[phi.value.0 as usize] = new;
+                            changed = true;
+                        }
+                    }
+                    for inst in &block.insts {
+                        for (k, &(_, v)) in inst.writes.iter().enumerate() {
+                            let reload = t
+                                .spilled
+                                .get(&v)
+                                .map(|pd| t.first_spilled[pd])
+                                .filter(|&first| first != v)
+                                .map(Moved::Value);
+                            let new = match reload
+                                .or_else(|| copy_source(inst, k))
+                                .or_else(|| t.restored(inst))
+                            {
+                                Some(Moved::Const(c)) => Some(Term::Const(c)),
+                                Some(Moved::Value(s)) => o[s.0 as usize],
+                                None => Some(Term::Value(v)),
+                            };
+                            if new.is_some() && new != o[v.0 as usize] {
+                                o[v.0 as usize] = new;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if !changed {
+                    return o
+                        .into_iter()
+                        .enumerate()
+                        .map(|(v, x)| x.unwrap_or(Term::Value(Value(v as u32))))
+                        .collect();
+                }
+            }
+            panic!("reference did not settle");
+        }
+
+        let build_words = |words: &[u32]| -> Program {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            crate::ir::build(&code, false, 256).unwrap()
+        };
+
+        let layout = [param(Table, 0, 1)];
+
+        // 1) Acyclic chain of moves + constants + diamond phi.
+        let acyclic = build_words(&[
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0304, // s_mov_b32 s5, s4
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 -> arm_b
+            0xBE86_0305, // s_mov_b32 s6, s5
+            0xBF82_0001, // s_branch -> join
+            0xBE86_0304, // s_mov_b32 s6, s4
+            0xBE87_0306, // join: s_mov_b32 s7, s6
+            S_ENDPGM,
+        ]);
+        let t_acyc = Tracer::new(&acyclic, &layout, HwStage::Cs, None).unwrap();
+        assert_eq!(t_acyc.origin, reference_origins(&t_acyc));
+
+        // 2) Cyclic loop carrying an invariant move and a changing register.
+        let cyclic = build_words(&[
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0304, // loop: s_mov_b32 s6, s4
+            0x8005_8105, // s_add_u32 s5, s5, 1
+            0xBF06_8405, // s_cmp_eq_u32 s5, 4
+            0xBF84_FFFC, // s_cbranch_scc0 -> loop
+            0xBE87_0306, // s_mov_b32 s7, s6
+            S_ENDPGM,
+        ]);
+        let t_cyc = Tracer::new(&cyclic, &layout, HwStage::Cs, None).unwrap();
+        assert_eq!(t_cyc.origin, reference_origins(&t_cyc));
+
+        // 3) Waterfall multi-block cyclic CFG.
+        let wf_code: Vec<u8> = WATERFALL_JOINED_BUFFER_WAVE32
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let wf_p = crate::ir::build(&wf_code, false, 256).unwrap();
+        let wf_st = crate::structure::structure(&wf_p).unwrap();
+        let t_wf = Tracer::new(&wf_p, &layout, HwStage::Ps, Some(&wf_st)).unwrap();
+        assert_eq!(t_wf.origin, reference_origins(&t_wf));
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_resource_track() {
+        let build_words = |words: &[u32]| -> Program {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            crate::ir::build(&code, false, 256).unwrap()
+        };
+        // 1) Straight-line shader: 4,000 VALU + 200 s_mov_b32 + 128 s_load_dwordx4 + 256 buffer_load_dword.
+        let mut words = vec![0xBE84_0300u32, 0xBE85_0380, 0x7E00_0280];
+        for i in 0..200u32 {
+            words.push(0xBE86_0300 | ((i & 1) + 4)); // s_mov_b32 s6, s4/s5
+        }
+        for _ in 0..128 {
+            words.extend_from_slice(&[
+                0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+                0xE030_2000, 0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen
+                0xE030_2000, 0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen
+            ]);
+        }
+        for _ in 0..2000 {
+            words.push(0x7E04_0D00); // v_cvt_f32_u32 v2, v0
+            words.push(0x0600_0102); // v_add_f32 v0, v2, v0
+        }
+        words.push(S_ENDPGM);
+        let p_acyc = build_words(&words);
+        let st_acyc = crate::structure::structure(&p_acyc).unwrap();
+        let layout = [param(Table, 0, 1)];
+
+        // 2) Loopy shader: loop with phis + 2,000 non-copy VALU ops inside loop body.
+        let mut loop_words = vec![
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0x7E00_0280,    // v_mov_b32 v0, 0
+            0xBE86_0304,    // loop: s_mov_b32 s6, s4
+        ];
+        for _ in 0..1000 {
+            loop_words.push(0x7E04_0D00);
+            loop_words.push(0x0600_0102);
+        }
+        loop_words.extend_from_slice(&[
+            0x8005_8105, // s_add_u32 s5, s5, 1
+            0xBF06_8405, // s_cmp_eq_u32 s5, 4
+            0xBF84_F82C, // s_cbranch_scc0 -> loop (-2004 dwords)
+            S_ENDPGM,
+        ]);
+        let p_loop = build_words(&loop_words);
+        let st_loop = crate::structure::structure(&p_loop).unwrap();
+
+        let _ = track(&p_acyc, &layout, HwStage::Cs, Some(&st_acyc)).unwrap();
+        let _ = track(&p_loop, &layout, HwStage::Cs, Some(&st_loop)).unwrap();
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..50 {
+            std::hint::black_box(track(&p_acyc, &layout, HwStage::Cs, Some(&st_acyc)).unwrap().descriptors.len());
+        }
+        let acyc_us = t0.elapsed().as_secs_f64() * 1e6 / 50.0;
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..50 {
+            std::hint::black_box(track(&p_loop, &layout, HwStage::Cs, Some(&st_loop)).unwrap().scalar.len());
+        }
+        let loop_us = t1.elapsed().as_secs_f64() * 1e6 / 50.0;
+        eprintln!("resource::track: acyclic_4584={acyc_us:.1} us/run, loop_2007={loop_us:.1} us/run");
     }
 }
