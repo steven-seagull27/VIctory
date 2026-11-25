@@ -439,3 +439,79 @@ fn ordered_pixel_sections_use_rasterizer_ordered_views() {
     };
     assert_eq!(what, "a hardware SGPR input");
 }
+
+/// Every lane observes the same scalar branch. Lane 0 sets the only VCC bit;
+/// a subsequent CMPX enables lane 1, leaving the VCC bit in an inactive lane.
+#[test]
+fn vcc_branches_take_one_scalar_path_for_the_wave() {
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(32),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut mistakes = 0;
+    let mut ran = 0;
+    for (name, branch, nonzero) in [("vccz", 0xbf86_0001, false), ("vccnz", 0xbf87_0001, true)] {
+        for (comparison, any) in [(0x7d84_0080, true), (0x7d84_00ad, false)] {
+            let shader = build(&[
+                0xbe84_0300,
+                0xbe85_0380, // s[4:5] = descriptor table
+                0xf408_0a02,
+                0xfa00_0040, // output UAV at byte 64
+                0x3420_0082, // v16 = 4 * lane
+                0xbe90_038b, // s16 = 11 (taken path)
+                comparison,  // vcc = lane == 0 (or lane == 45)
+                0x7da4_0081, // exec = lane == 1
+                branch,
+                0xbe90_0397, // s16 = 23 (fallthrough path)
+                0xbefe_03c1, // restore all lanes
+                0x7e06_0210, // v3 = s16
+                0xbf8c_c07f, // wait for the output descriptor
+                0xe070_1000,
+                0x800a_0310, // store v3 at lane * 4
+                0xbf81_0000,
+            ])
+            .expect("lower");
+            let mut dxil = shader.dxil.clone();
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut dxil).expect("DXIL validation failed");
+            }
+            let expected = if any == nonzero { 11 } else { 23 };
+            for (adapter, warp) in [("hardware", false), ("warp", true)] {
+                let Ok(host) = Host::new(warp) else { continue };
+                let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+                let ud = vec![0; shader.user_data_dwords().max(1) as usize];
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &views,
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .expect("dispatch");
+                ran += 1;
+                assert_eq!(out[0].len(), 32);
+                let mismatches = out[0].iter().filter(|&&got| got != expected).count();
+                eprintln!(
+                    "MIXED {adapter} {name} any={any} want={expected} mismatches={mismatches}/32 values={:?}",
+                    out[0]
+                );
+                mistakes += mismatches;
+            }
+        }
+    }
+    assert!(ran > 0, "no SM 6.6 hardware or WARP device available");
+    assert_eq!(mistakes, 0);
+}
