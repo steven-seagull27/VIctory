@@ -8788,10 +8788,14 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        // A heap-indexed buffer read by element has no used-resource entry,
-        // so no stride: its bytes are addressed as the hardware does, the
-        // element times the view's stride (the host's table) plus the offset.
+        // A used-resource entry with stride 0 is a raw buffer: on hardware, an
+        // index with stride 0 adds nothing to the address, so drop the index
+        // and address at `off` through the raw view. A heap-indexed buffer read
+        // by element has no used-resource entry, so no stride: its bytes are
+        // addressed as the hardware does, the element times the view's stride
+        // (the host's table) plus the offset.
         let index = match index {
+            Some(_) if used.is_some_and(|u| u.stride == 0) && !typed && format.is_none() => None,
             Some(i) if used.is_none() && !typed => {
                 let stride = self.view_stride(src)?;
                 let rows = self.s.m.bin(c, Bin::Mul, i, stride);
