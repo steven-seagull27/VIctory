@@ -222,6 +222,12 @@ impl Ranges<'_> {
     /// if every lane begins at the same value and takes the same step.
     /// Recognize a single-block loop entered unconditionally from the entry
     /// block: its only other incoming edge is the uniform branch to itself.
+    /// Because the entry block runs unconditionally, the initializer sets the
+    /// same constant across all launched lanes; inside the loop, the unguarded
+    /// `v_add_nc_u32` constant step advances every lane together and the
+    /// whole-wave `s_cbranch_vcc*` back edge keeps every lane in lockstep, so
+    /// the compare result is uniform across the wave and bounds `a` in every
+    /// lane equally.
     fn uniform_counter_compare(&self, header: usize, a: Value, lo: Value, hi: Value) -> bool {
         let unguarded = |v, block| {
             let &Def::Inst(b, i) = self.defs.get(&v)? else {
@@ -294,7 +300,7 @@ impl Ranges<'_> {
         let name = inst.name();
         let (op, src) = match &inst.fields {
             Fields::Valu(v)
-                if v.sdwa.is_none() && v.dpp.is_none() && v.abs | v.neg | v.opsel == 0 =>
+                if v.sdwa.is_none() && v.dpp.is_none() && (v.abs | v.neg | v.opsel) == 0 =>
             {
                 (
                     name.strip_prefix("v_cmpx_")
