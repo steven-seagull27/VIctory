@@ -2209,6 +2209,85 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// Read the depth plane through the title's typed SRV of each host typeless depth family.
+    /// Run this ignored test with the diagnostics feature and VICTORY_D3D12_DEBUG=1.
+    /// Use separate processes with VICTORY_D3D12_WARP=0 and 1 for hardware and software readbacks.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "requires a D3D12 device and the Windows Graphics Tools debug layer"]
+    fn typed_depth_srvs_read_the_rendered_depth() {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+        };
+
+        assert!(crate::switch::on("VICTORY_D3D12_DEBUG"), "set VICTORY_D3D12_DEBUG=1");
+        let host = crate::host::host().expect("a D3D12 device");
+        host.device.cast::<ID3D12InfoQueue>().expect("install Windows Graphics Tools");
+        // Host initialization runs its own calibration before this test.
+        host.log_messages();
+        // SAFETY: resolve the adapter for this live device.
+        let adapter = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(host.device.GetAdapterLuid()).unwrap();
+            adapter.GetDesc1().unwrap()
+        };
+        assert_eq!(adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0, crate::switch::on("VICTORY_D3D12_WARP"));
+        let name = String::from_utf16_lossy(&adapter.Description);
+        let name = name.trim_end_matches('\0');
+        let read = compile_cs(r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u1)"
+Texture2D<float> depth : register(t0);
+RWByteAddressBuffer outputWords : register(u1);
+[RootSignature(RS)]
+[numthreads(4,4,1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    outputWords.Store(4 * (id.x + 4 * id.y), asuint(depth.Load(int3(id.xy, 0))));
+}
+"#);
+        let slots = Slots::new(1);
+        for (typed, typeless, tolerance) in [
+            (DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32G8X24_TYPELESS, 0.0),
+            (DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_TYPELESS, 0.0),
+            (DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24G8_TYPELESS, 1.0 / 16_777_215.0),
+            (DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_TYPELESS, 1.0 / 65_535.0),
+        ] {
+            let flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 as u32;
+            let title = texture_at_address(title_memory(1 << 16), &texture_words(4, 4, typed.0 as u32, 0, flags));
+            let copy = crate::resource::host_copy(title).expect("a host copy for the depth texture");
+            // SAFETY: the copy owns this live texture.
+            assert_eq!(unsafe { copy.texture.GetDesc() }.Format, typeless);
+            let dsv = host.dsv(&copy.texture, Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+                Format: typed, ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D, ..Default::default()
+            }));
+            let srv = [typed.0 as u32, D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32,
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 0, 0, 1, 0, 0, 0, 0];
+            slots.make(0, &View::Shader(title as usize, Some(srv)));
+            assert_eq!(host.log_messages(), None, "{typed:?} descriptor creation");
+            let (out, data) = host.shared_buffer(16 * 4).unwrap();
+            let list = host.new_list().unwrap();
+            crate::list::ensure_state(&list, title, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
+            let left = RECT { left: 0, top: 0, right: 2, bottom: 4 };
+            // SAFETY: the view covers this texture, which is writable as depth.
+            unsafe {
+                list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.25, 0, None);
+                list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.75, 0, Some(&[left]));
+            }
+            crate::list::ensure_state(&list, title, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32);
+            run(&list, &slots, &read, 0, Some(&out), (1, 1));
+            list.close();
+            assert_eq!(host.log_messages(), None, "{typed:?} command recording");
+            host.execute(&[&list]);
+            // SAFETY: the submission completed and all 16 dwords are inside the mapped output.
+            let pixels = unsafe { std::slice::from_raw_parts(data.cast::<f32>(), 16) };
+            for (i, &got) in pixels.iter().enumerate() {
+                let expected = if i % 4 < 2 { 0.75 } else { 0.25 };
+                assert!((got - expected).abs() <= tolerance, "{name} {typed:?} texel {i}: got {got}, expected {expected}");
+            }
+            eprintln!("{name} {typed:?}: 16/16 depth samples matched, first row {:?}", &pixels[..4]);
+        }
+    }
+
     /// A depth texture with stencil (the console's 16-bit depth, the
     /// host's 24-bit) written through unordered views of its planes, then
     /// read as depth and stencil: the 16-bit depth arrives in 24 bits as
