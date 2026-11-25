@@ -11,6 +11,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::mem::offset_of;
+#[cfg(windows)]
+use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC;
 
 use crate::object::{
     self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
@@ -651,7 +653,7 @@ extern "system" fn resolve(
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
-            let format = resolve_format(format);
+            let format = resolve_format(format, [(&b, src_sub), (&a, dst_sub)]);
             if (a.Width, a.Height) == (b.Width, b.Height) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
@@ -681,11 +683,25 @@ extern "system" fn resolve(
     let _ = (this, dst, dst_sub, src, src_sub, format);
 }
 
-/// The host's format for a resolve in the console's `format`: the host
-/// textures of formats it has no id for (118-120) are made in `pc_format`s.
+/// A resolve of the depth plane of format 118 takes the plane's typed
+/// format. The host's depth/stencil view names both planes.
 #[cfg(windows)]
-fn resolve_format(format: u32) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
-    windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(crate::resource::pc_format(format) as i32)
+fn resolve_format(
+    format: u32,
+    subresources: [(&D3D12_RESOURCE_DESC, u32); 2],
+) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS};
+    // On a 2D MSAA resolve, all mip levels and array slices of plane 0
+    // precede the first stencil subresource. The two textures may differ.
+    if format == 118
+        && subresources.into_iter().all(|(desc, index)| {
+            index < u32::from(desc.MipLevels) * u32::from(desc.DepthOrArraySize)
+        })
+    {
+        DXGI_FORMAT_R24_UNORM_X8_TYPELESS
+    } else {
+        DXGI_FORMAT(crate::resource::pc_format(format) as i32)
+    }
 }
 
 #[repr(C)]
@@ -1546,6 +1562,9 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 
+#[cfg(all(test, windows))]
+mod resolve_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1582,12 +1601,25 @@ mod tests {
         }
     }
 
-    /// A resolve names the format the host texture was made in.
     #[cfg(windows)]
     #[test]
-    fn resolves_name_the_formats_of_the_host_textures() {
-        assert_eq!([118, 119, 120].map(|f| resolve_format(f).0), [45, 46, 47]);
-        assert_eq!(resolve_format(28).0, 28);
+    fn resolves_select_the_depth_format_only_when_both_subresources_are_depth() {
+        let src = D3D12_RESOURCE_DESC {
+            MipLevels: 1,
+            DepthOrArraySize: 2,
+            ..Default::default()
+        };
+        let dst = D3D12_RESOURCE_DESC {
+            MipLevels: 3,
+            ..src
+        };
+        let format = |guest, from, to| resolve_format(guest, [(&src, from), (&dst, to)]).0;
+        assert_eq!(format(118, 1, 5), 46);
+        assert_eq!(format(118, 2, 5), 45);
+        assert_eq!(format(118, 1, 6), 45);
+        assert_eq!(format(119, 1, 5), 46);
+        assert_eq!(format(120, 2, 6), 47);
+        assert_eq!(format(28, 0, 0), 28);
     }
 
     #[test]
