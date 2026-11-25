@@ -1954,6 +1954,8 @@ const QUAD_STRIP: u32 = 20;
 
 #[cfg(test)]
 mod tests {
+    mod descriptor_counts;
+
     use super::*;
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
