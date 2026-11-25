@@ -194,6 +194,9 @@ mod flow_tests;
 pub mod host;
 mod lower;
 #[cfg(all(test, windows))]
+#[path = "../../../../tests/permlane-native/dispatch.rs"]
+mod permlane_native;
+#[cfg(all(test, windows))]
 mod permlane_tests;
 mod rect;
 pub use rect::rectangle_gs;
