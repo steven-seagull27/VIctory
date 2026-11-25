@@ -1221,6 +1221,9 @@ pub enum View<'a> {
     /// An RGBA32F texture SRV with mips (width, height, levels, texels of
     /// each level in turn).
     Mipped(u32, u32, u32, &'a [[f32; 4]]),
+    /// An RGBA32F volume SRV (width, height, depth, levels, texels in
+    /// x, y, z order within each mip level).
+    Volume(u32, u32, u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV with mips (face size, levels, texels of each
@@ -1423,16 +1426,22 @@ impl Host {
                     View::Texture(..)
                     | View::Cube(..)
                     | View::Mipped(..)
+                    | View::Volume(..)
                     | View::MippedCube(..) => {
-                        let (w0, h0, mut texels, faces, levels) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1, 1),
-                            View::Mipped(w, h, l, t) => (w, h, t, 1, l),
-                            View::Cube(n, t) => (n, n, t, 6, 1),
-                            View::MippedCube(n, l, t) => (n, n, t, 6, l),
+                        let (w0, h0, depth, mut texels, faces, levels) = match *v {
+                            View::Texture(w, h, t) => (w, h, 1, t, 1, 1),
+                            View::Mipped(w, h, l, t) => (w, h, 1, t, 1, l),
+                            View::Volume(w, h, d, l, t) => (w, h, d, t, 1, l),
+                            View::Cube(n, t) => (n, n, 1, t, 6, 1),
+                            View::MippedCube(n, l, t) => (n, n, 1, t, 6, l),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w0, h0, D3D12_RESOURCE_FLAG_NONE);
                         desc.DepthOrArraySize = faces as u16;
+                        if matches!(v, View::Volume(..)) {
+                            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+                            desc.DepthOrArraySize = depth as u16;
+                        }
                         desc.MipLevels = levels as u16;
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
@@ -1443,15 +1452,17 @@ impl Host {
                         for face in 0..(faces * levels) as usize {
                             let level = face as u32 % levels;
                             let (w, h) = ((w0 >> level).max(1), (h0 >> level).max(1));
+                            let d = (depth >> level).max(1);
+                            let rows = h as usize * d as usize;
                             let pitch = (w as usize * 16).next_multiple_of(256);
                             let upload = make(
                                 D3D12_HEAP_TYPE_UPLOAD,
-                                &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
+                                &buffer((pitch * rows) as u64, D3D12_RESOURCE_FLAG_NONE),
                                 D3D12_RESOURCE_STATE_GENERIC_READ,
                             )?;
                             let mut p = std::ptr::null_mut();
                             upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                            for y in 0..h as usize {
+                            for y in 0..rows {
                                 let row = &texels[y * w as usize..(y + 1) * w as usize];
                                 std::ptr::copy_nonoverlapping(
                                     row.as_ptr().cast::<u8>(),
@@ -1459,16 +1470,18 @@ impl Host {
                                     row.len() * 16,
                                 );
                             }
-                            texels = &texels[(w * h) as usize..];
+                            texels = &texels[w as usize * rows..];
                             upload.Unmap(0, None);
                             let mut at_face = subresource(&tex);
                             at_face.Anonymous.SubresourceIndex = face as u32;
+                            let mut source = footprint(&upload, w, h);
+                            source.Anonymous.PlacedFootprint.Footprint.Depth = d;
                             list.CopyTextureRegion(
                                 &at_face,
                                 0,
                                 0,
                                 0,
-                                &footprint(&upload, w, h),
+                                &source,
                                 None,
                             );
                             keep.push(upload);

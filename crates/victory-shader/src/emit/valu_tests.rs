@@ -1440,8 +1440,8 @@ const fn mimg_sample(op: u32, vdata: u8, vaddr: u8, dim: u32, a16: bool) -> [u32
 /// gradients read as 16-bit ones give level 4), where (u, v) = (0.3125,
 /// 0.75) is texel (2, 1). A clamp of 4 picks level 4, texel (1, 0). A
 /// comparison sample of 16-bit gradients is refused as the 32-bit one is
-/// (SM 6.6 has no `SampleCmpGrad`); the 3D forms are translated and
-/// validated only (the host tests have no 3D view).
+/// (SM 6.6 has no `SampleCmpGrad`). A volume with tagged texels also
+/// checks the third derivative component in each gradient direction.
 #[test]
 fn gradient_samples_of_16_bits() {
     use windows::Win32::Graphics::Direct3D12::*;
@@ -1514,13 +1514,53 @@ fn gradient_samples_of_16_bits() {
         let want = if cl { at(4, 1, 0) } else { at(3, 2, 1) };
         cases.push((label, shader, want));
     }
-    // 3D: x, y, z per direction, 16-bit gradients two VGPRs a direction.
-    for (label, op, a16, n) in [
-        ("3D image_sample_d a16", 0x22, true, 8),
-        ("3D image_sample_d_g16", 0xA2, false, 7),
-        ("3D image_sample_d_g16 a16", 0xA2, true, 6),
+    // At 16x8x32, dPdx=(1/32, 0, 1/16) spans just over two texels
+    // (mip 1); dPdy=(0, 1/16, -1/8) spans just over four (mip 2).
+    // Only the named direction is active. Each packed direction's z
+    // occupies its own VGPR, with an intentionally nonzero unused half.
+    let tag = |level: u32, x: u32, y: u32, z: u32| (10000 * level + 100 * z + 16 * y + x) as f32;
+    let mut volume_cases = Vec::new();
+    for (dir, dx, dy, dx16, dy16, expected) in [
+        (
+            "dx",
+            [1.0 / 32.0, 0.0, 1.0 / 16.0],
+            [0.0; 3],
+            [0x2800, 0x4400_2c00],
+            [0, 0x4400_0000],
+            tag(1, 2, 2, 9),
+        ),
+        (
+            "dy",
+            [0.0; 3],
+            [0.0, 1.0 / 16.0, -1.0 / 8.0],
+            [0, 0x4400_0000],
+            [0x2c00_0000, 0x4400_b000],
+            tag(2, 1, 1, 4),
+        ),
     ] {
-        lower(label, &program(op, 2, a16, &vec![0; n]));
+        for (cl, g16, a16) in (0..8).map(|k| (k & 4 != 0, k & 2 != 0, k & 1 != 0)) {
+            let mut addr = Vec::new();
+            if g16 {
+                addr.extend(dx16);
+                addr.extend(dy16);
+            } else {
+                addr.extend(dx.map(f));
+                addr.extend(dy.map(f));
+            }
+            // u=11/32, v=11/16, w=19/32; clamp=3 shares w's VGPR under a16.
+            if a16 {
+                addr.extend([0x3980_3580, (if cl { 0x4200_0000 } else { 0 }) | 0x38c0]);
+            } else {
+                addr.extend([f(11.0 / 32.0), f(11.0 / 16.0), f(19.0 / 32.0)]);
+                if cl {
+                    addr.push(f(3.0));
+                }
+            }
+            let label = format!("3D {dir} cl={cl} g16={g16} a16={a16}");
+            let op = 0x22 | u32::from(cl) | u32::from(g16) << 7;
+            let shader = lower(&label, &program(op, 2, a16, &addr));
+            volume_cases.push((label, shader, if cl { tag(3, 0, 0, 2) } else { expected }));
+        }
     }
     let refused = try_lower_cs32(&program(0xAA, 1, false, &[0; 5]), &used);
     let Err(crate::ShaderError::Unsupported { what, .. }) = refused else {
@@ -1546,6 +1586,17 @@ fn gradient_samples_of_16_bits() {
         }
     }
     let views = [View::Mipped(64, 16, 5, &texels), View::RawUav(1)];
+    let mut voxels = Vec::new();
+    for level in 0..4 {
+        for z in 0..32 >> level {
+            for y in 0..8 >> level {
+                for x in 0..16 >> level {
+                    voxels.push([tag(level, x, y, z), 0.0, 0.0, 1.0]);
+                }
+            }
+        }
+    }
+    let volume_views = [View::Volume(16, 8, 32, 4, &voxels), View::RawUav(1)];
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (adapter, warp) in [("hardware", false), ("warp", true)] {
@@ -1553,7 +1604,11 @@ fn gradient_samples_of_16_bits() {
             eprintln!("no SM 6.6 {adapter} device; skipped");
             continue;
         };
-        for (label, shader, want) in &cases {
+        for ((label, shader, want), views) in cases
+            .iter()
+            .map(|case| (case, &views))
+            .chain(volume_cases.iter().map(|case| (case, &volume_views)))
+        {
             let (root, pso) = host
                 .compute_pipeline(shader)
                 .unwrap_or_else(|e| panic!("{adapter} {label}: {e}"));
@@ -1563,7 +1618,7 @@ fn gradient_samples_of_16_bits() {
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(user_data_cs32(shader, 0)))],
-                        views: &views,
+                        views,
                         samplers: &samplers,
                         groups: [1, 1, 1],
                     },
