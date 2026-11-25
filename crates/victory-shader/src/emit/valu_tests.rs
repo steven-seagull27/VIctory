@@ -1428,6 +1428,31 @@ const fn mimg_sample(op: u32, vdata: u8, vaddr: u8, dim: u32, a16: bool) -> [u32
     ]
 }
 
+const GRADIENT_BINDINGS: [(u8, ResourceType, u32, u8); 3] = [
+    (4, ResourceType::Srv, 0, 8),
+    (4, ResourceType::Uav, 8, 4),
+    (6, ResourceType::Sampler, 0, 4),
+];
+
+fn gradient_sample_program(op: u32, dim: u32, a16: bool, addr: &[u32]) -> Vec<u32> {
+    // Descriptors: s[8:15] the texture (heap index 0), s[20:23] the raw UAV
+    // (1), s[16:19] the sampler.
+    let mut w = vec![s_mov_b32(5, 0x80), s_mov_b32(7, 0x80)];
+    for (op, dst, base, offset) in [(3u32, 8u32, 4u32, 0u32), (2, 20, 4, 0x20), (2, 16, 6, 0)] {
+        w.extend([
+            0x3D << 26 | op << 18 | dst << 6 | base >> 1,
+            125 << 25 | offset,
+        ]);
+    }
+    for (k, &x) in addr.iter().enumerate() {
+        w.extend([vop1(0x001, k as u8, 255), x]);
+    }
+    w.extend(mimg_sample(op, 20, 0, dim, a16));
+    w.extend(buffer_store_dword(20, 20, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
 /// Gradient samples with 16-bit (`image_sample_d_g16`, `_d_cl_g16`) and
 /// 32-bit derivatives, each with 32-bit and 16-bit (`a16`) coordinates:
 /// the two are independent on RDNA2, `a16` packing the coordinates and
@@ -1445,31 +1470,8 @@ const fn mimg_sample(op: u32, vdata: u8, vaddr: u8, dim: u32, a16: bool) -> [u32
 #[test]
 fn gradient_samples_of_16_bits() {
     use windows::Win32::Graphics::Direct3D12::*;
-    // Descriptors: s[8:15] the texture (heap index 0), s[20:23] the raw UAV
-    // (1), s[16:19] the sampler.
-    let mut prefix = vec![s_mov_b32(5, 0x80), s_mov_b32(7, 0x80)];
-    for (op, dst, base, offset) in [(3u32, 8u32, 4u32, 0u32), (2, 20, 4, 0x20), (2, 16, 6, 0)] {
-        prefix.extend([
-            0x3D << 26 | op << 18 | dst << 6 | base >> 1,
-            125 << 25 | offset,
-        ]);
-    }
-    let used = [
-        (4, ResourceType::Srv, 0, 8),
-        (4, ResourceType::Uav, 8, 4),
-        (6, ResourceType::Sampler, 0, 4),
-    ];
-    // The address VGPRs set from literals, the sample into v20, stored.
-    let program = |op: u32, dim: u32, a16: bool, addr: &[u32]| {
-        let mut w = prefix.clone();
-        for (k, &x) in addr.iter().enumerate() {
-            w.extend([vop1(0x001, k as u8, 255), x]);
-        }
-        w.extend(mimg_sample(op, 20, 0, dim, a16));
-        w.extend(buffer_store_dword(20, 20, 0));
-        w.push(S_ENDPGM);
-        w
-    };
+    let program = gradient_sample_program;
+    let used = GRADIENT_BINDINGS;
     // Gradients x then y, then the coordinates and clamp; as f16, 1/16,
     // 19/32, 0.3125, 0.75 and 4 are 0x2C00, 0x38C0, 0x3500, 0x3A00 and
     // 0x4400.
@@ -1570,6 +1572,108 @@ fn gradient_samples_of_16_bits() {
                 )
                 .unwrap_or_else(|e| panic!("{adapter} {label}: {e}"));
             assert_eq!(f32::from_bits(out[0][0]), *want, "{adapter}: {label}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device");
+}
+
+/// Isotropic point samples with level and position tags on all six faces.
+/// The larger face derivative is in the high f16 half, in dPdx or dPdy.
+#[test]
+fn cube_gradients_of_16_bits() {
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    let tag = |face: u32, mip: u32, x: u32, y: u32| (10000 * face + 1000 * mip + 32 * y + x) as f32;
+    let mut texels = Vec::new();
+    for face in 0..6 {
+        for mip in 0..4 {
+            for y in 0..32 >> mip {
+                for x in 0..32 >> mip {
+                    texels.push([tag(face, mip, x, y), 0.0, 0.0, 1.0]);
+                }
+            }
+        }
+    }
+    let views = [View::MippedCube(32, 4, &texels), View::RawUav(1)];
+    let samplers = [D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    }];
+    let mut cases = Vec::new();
+    for (face, face16) in [0, 0x3c00, 0x4000, 0x4200, 0x4400, 0x4500]
+        .into_iter()
+        .enumerate()
+    {
+        let face = face as u32;
+        // (1/32, ±1/8) spans sqrt(17) base-level texels. Point sampling
+        // selects mip 2. A minimum LOD of 3 selects the last level.
+        let (grad32, grad16) = if face % 2 == 0 {
+            ([1.0 / 32.0, 1.0 / 8.0, 0.0, 0.0], [0x3000_2800, 0])
+        } else {
+            ([0.0, 0.0, 1.0 / 32.0, -1.0 / 8.0], [0, 0xb000_2800])
+        };
+        for (cl, g16, a16) in (0..8).map(|k| (k & 4 != 0, k & 2 != 0, k & 1 != 0)) {
+            let mut addr = Vec::new();
+            if g16 {
+                addr.extend(grad16);
+            } else {
+                addr.extend(grad32.map(f32::to_bits));
+            }
+            // Cube face operands s=1+11/32, t=1+21/32, face. Under a16
+            // the minimum LOD shares the upper half of the face word.
+            if a16 {
+                addr.extend([0x3ea0_3d60, face16 | if cl { 0x4200_0000 } else { 0 }]);
+            } else {
+                addr.extend([1.34375, 1.65625, face as f32].map(f32::to_bits));
+                if cl {
+                    addr.push(3.0f32.to_bits());
+                }
+            }
+            let op = 0x22 | u32::from(cl) | (u32::from(g16) << 7);
+            let words = gradient_sample_program(op, 3, a16, &addr);
+            let shader = lower_cs32(&words, &GRADIENT_BINDINGS, true);
+            let expected = if cl {
+                tag(face, 3, 1, 2)
+            } else {
+                tag(face, 2, 2, 5)
+            };
+            cases.push((
+                format!("face={face} cl={cl} g16={g16} a16={a16}"),
+                shader,
+                expected,
+            ));
+        }
+    }
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (adapter, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {adapter} device; skipped");
+            continue;
+        };
+        for (label, shader, expected) in &cases {
+            let (root, pso) = host.compute_pipeline(shader).unwrap();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(user_data_cs32(shader, 0)))],
+                        views: &views,
+                        samplers: &samplers,
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let got = f32::from_bits(out[0][0]);
+            assert_eq!(got, *expected, "{adapter}: {label}");
         }
         ran += 1;
     }
