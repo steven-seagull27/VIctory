@@ -163,7 +163,7 @@ impl HostHeap {
             // memory pairs and the 3 top null/clamp slots inside `views`.
             let cap = views.max(PORTABLE_VIEWS);
             let reserve = CAPPED_PAIRS + 3;
-            match make(count + MIN_DYNAMIC) {
+            match make((count + MIN_DYNAMIC).max(views)) {
                 Ok(heap) if count + MIN_DYNAMIC + reserve <= cap => (heap, count, MIN_DYNAMIC),
                 _ if count + MIN_DYNAMIC + reserve > cap => {
                     let title_slots = cap.saturating_sub(CAPPED_DYNAMIC + reserve);
