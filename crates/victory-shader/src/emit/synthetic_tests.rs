@@ -65,6 +65,10 @@ fn program(whole: bool) -> Vec<u32> {
 }
 
 fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    build_shader(&compute_program(words))
+}
+
+fn compute_program(words: &[u32]) -> NativeProgram {
     let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
         kind,
         root: RootType::Table,
@@ -75,7 +79,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         user_data: 0,
         slot: 0,
     };
-    let native = NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 32,
@@ -97,8 +101,11 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
             threads: [32, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
-    let lowered = lowered(&native)?;
+    }
+}
+
+fn build_shader(native: &NativeProgram) -> Result<HostShader, crate::ShaderError> {
+    let lowered = lowered(native)?;
     Ok(HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -438,4 +445,265 @@ fn ordered_pixel_sections_use_rasterizer_ordered_views() {
         panic!("translated a collision id outside an ordered section");
     };
     assert_eq!(what, "a hardware SGPR input");
+}
+
+/// Every lane observes the same scalar branch. Lane 0 sets the only VCC bit;
+/// a subsequent CMPX enables lane 1, leaving the VCC bit in an inactive lane.
+#[test]
+fn vcc_branches_take_one_scalar_path_for_the_wave() {
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(32),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut mistakes = 0;
+    let mut ran = 0;
+    let mut unsupported = 0;
+    for (name, branch, nonzero) in [("vccz", 0xbf86_0001, false), ("vccnz", 0xbf87_0001, true)] {
+        for (comparison, any) in [(0x7d84_0080, true), (0x7d84_00ad, false)] {
+            let shader = build(&[
+                0xbe84_0300,
+                0xbe85_0380, // s[4:5] = descriptor table
+                0xf408_0a02,
+                0xfa00_0040, // output UAV at byte 64
+                0x3420_0082, // v16 = 4 * lane
+                0xbe90_038b, // s16 = 11 (taken path)
+                comparison,  // vcc = lane == 0 (or lane == 45)
+                0x7da4_0081, // exec = lane == 1
+                branch,
+                0xbe90_0397, // s16 = 23 (fallthrough path)
+                0xbefe_03c1, // restore all lanes
+                0x7e06_0210, // v3 = s16
+                0xbf8c_c07f, // wait for the output descriptor
+                0xe070_1000,
+                0x800a_0310, // store v3 at lane * 4
+                0xbf81_0000,
+            ])
+            .expect("lower");
+            let mut dxil = shader.dxil.clone();
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut dxil).expect("DXIL validation failed");
+            }
+            let expected = if any == nonzero { 11 } else { 23 };
+            for (adapter, warp) in [("hardware", false), ("warp", true)] {
+                let host = match Host::new(warp) {
+                    Ok(host) => host,
+                    Err(error) => {
+                        eprintln!("{adapter}: no SM 6.6 device ({error})");
+                        continue;
+                    }
+                };
+                if !supports_guest_wave(&host, adapter, 32) {
+                    unsupported += 1;
+                    continue;
+                }
+                let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+                let ud = vec![0; shader.user_data_dwords().max(1) as usize];
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &views,
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .expect("dispatch");
+                ran += 1;
+                assert_eq!(out[0].len(), 32);
+                let mismatches = out[0].iter().filter(|&&got| got != expected).count();
+                eprintln!(
+                    "MIXED {adapter} {name} any={any} want={expected} mismatches={mismatches}/32 values={:?}",
+                    out[0]
+                );
+                mistakes += mismatches;
+            }
+        }
+    }
+    assert!(ran > 0 || unsupported > 0, "no SM 6.6 hardware or WARP device available");
+    assert_eq!(mistakes, 0);
+}
+
+/// Two full guest waves in one group independently choose their scalar path.
+#[test]
+fn vcc_branches_isolate_two_full_guest_waves() {
+    check_group_vcc_branches(&[(32, 64), (64, 128)]);
+}
+
+/// The last real invocation can set VCC in a partially occupied second wave.
+#[test]
+fn vcc_branches_isolate_a_partial_second_guest_wave() {
+    check_group_vcc_branches(&[(32, 45), (64, 85)]);
+}
+
+/// A runtime root constant selects the only invocation that sets VCC. Narrow
+/// EXEC to lane 1 of each wave, then restore it to observe every lane's result.
+fn check_group_vcc_branches(groups: &[(u32, u32)]) {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut available = false;
+    for (adapter, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {adapter} device; skipped");
+            continue;
+        };
+        available = true;
+        for &(wave, threads) in groups {
+            if !supports_guest_wave(&host, adapter, wave) {
+                continue;
+            }
+            for (name, branch, nonzero) in
+                [("vccz", 0xbf86_0001, false), ("vccnz", 0xbf87_0001, true)]
+            {
+                let mut native = compute_program(&[
+                    0xbe84_0300,
+                    0xbe85_0380, // s[4:5] = descriptor table
+                    0xf408_0a02,
+                    0xfa00_0040,                    // output UAV at byte 64
+                    0x3420_0082,                    // v16 = 4 * group thread id
+                    0x3622_0000 | (128 + wave - 1), // v17 = group thread id & (wave - 1)
+                    0xbe90_038b,                    // s16 = 11 (taken)
+                    0x7d84_0002,                    // v_cmp_eq_u32 vcc, s2, v0
+                    0x7da4_2281,                    // v_cmpx_eq_u32 exec, 1, v17
+                    branch,
+                    0xbe90_0397, // s16 = 23 (fallthrough)
+                    if wave == 64 { 0xbefe_04c1 } else { 0xbefe_03c1 }, // restore EXEC
+                    0x7e06_0210,
+                    0xbf8c_c07f, // v3 = s16, wait for the output descriptor
+                    0xe070_1000,
+                    0x800a_0310, // store v3 at 4 * group thread id
+                    0xbf81_0000,
+                ]);
+                native.wave64 = wave == 64;
+                native.io = StageIo::Cs(ComputeIo {
+                    rsrc2: 3 << 1,
+                    threads: [threads, 1, 1],
+                });
+                native.layout.push(RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 2,
+                    slot: 1,
+                });
+                let shader = build_shader(&native).expect("lower");
+                if let Ok(mut validator) =
+                    validator::Validator::load(validator::Validator::default_path().as_deref())
+                {
+                    validator
+                        .validate(&mut shader.dxil.clone())
+                        .expect("DXIL validation");
+                }
+                let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+                let views = [
+                    View::Texture(1, 1, &[[0.0; 4]]),
+                    View::Buffer {
+                        data: &[0; 4],
+                        stride: Stride::Structured(16),
+                    },
+                    View::RawUav(threads + 4),
+                ];
+                // First wave (including its highest lane), last real invocation
+                // of wave two, and a missing invocation just outside the group.
+                for target in [0, wave - 1, threads - 1, threads] {
+                    let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
+                    for word in &shader.user_data {
+                        if word.root == RootType::Constants {
+                            ud[word.index as usize] = target;
+                        }
+                    }
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![(0, Root::Constants(ud))],
+                                views: &views,
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .expect("dispatch");
+                    let expected: Vec<u32> = (0..threads)
+                        .map(|id| {
+                            let any = target < threads && id / wave == target / wave;
+                            if any == nonzero { 11 } else { 23 }
+                        })
+                        .collect();
+                    let (actual, tail) = out[0].split_at(threads as usize);
+                    assert_eq!(tail, &[0; 4], "output beyond group");
+                    assert_eq!(
+                        actual, expected,
+                        "{adapter} wave{wave} group={threads} {name} target={target}"
+                    );
+                }
+                eprintln!("{adapter} Wave{wave} group={threads} {name}: all four readbacks matched");
+            }
+        }
+    }
+    assert!(available, "no SM 6.6 hardware or WARP device available");
+}
+
+fn supports_guest_wave(host: &Host, adapter: &str, wave: u32) -> bool {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: options has the size and layout requested by the feature.
+    unsafe {
+        host.device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                std::mem::size_of_val(&options) as u32,
+            )
+            .expect("D3D12 wave options");
+    }
+    let supported = options.WaveOps.as_bool()
+        && (options.WaveLaneCountMin..=options.WaveLaneCountMax).contains(&wave);
+    if !supported {
+        eprintln!(
+            "{adapter}: Wave{wave} unavailable (wave ops {}, lane range {}..={}); no dispatch",
+            options.WaveOps.as_bool(), options.WaveLaneCountMin, options.WaveLaneCountMax
+        );
+    }
+    supported
+}
+
+/// A scalar write inside an EXEC-shaped branch is visible to the whole
+/// guest wave. A normal DXIL phi would retain it only in the writing lanes.
+#[test]
+fn vcc_from_a_divergent_scalar_join_is_refused() {
+    let result = build(&[
+        0xbe84_0300, 0xbe85_0380, // s[4:5] = descriptor table
+        0xf408_0a02, 0xfa00_0040, // output UAV
+        0x3420_0082, // v16 = 4 * lane
+        0xbeea_0380, // s_mov_b32 vcc_lo, 0
+        0x7da4_0080, // exec = lane == 0
+        0xbf88_0001, // s_cbranch_execz skips the scalar write
+        0xbeea_0381, // s_mov_b32 vcc_lo, 1
+        0xbefe_03c1, // restore EXEC
+        0xbe90_038b, // s16 = 11
+        0xbf87_0001, // s_cbranch_vccnz skips the following move
+        0xbe90_0397, // s16 = 23
+        0x7e06_0210, // v3 = s16
+        0xbf8c_c07f, 0xe070_1000, 0x800a_0310, // store v3 at lane * 4
+        0xbf81_0000,
+    ]);
+    assert!(matches!(result, Err(crate::ShaderError::Unsupported {
+        what: "a scalar VCC branch depending on a divergent scalar join", ..
+    })));
 }

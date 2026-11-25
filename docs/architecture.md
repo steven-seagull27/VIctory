@@ -90,9 +90,11 @@ does not map title DLLs; `victory run` without `--execute` does).
 
 `victory_shader::ir::build` turns a native program into SSA, one
 instruction per machine instruction. `victory_shader::structure` then
-removes EXEC: lane masks become per-lane booleans, wave-wide mask tests
-become per-lane branches, and vector instructions keep a guard only where
-a lane can reach them with its EXEC bit clear. `victory_shader::range::build`
+represents EXEC as a per-lane boolean. Vector instructions keep a guard
+only where a lane can reach them with its EXEC bit clear. Branches on
+VCC zero or nonzero use one decision for the guest wave. Scalar writes
+supply the register bits directly. When a vector comparison supplies them,
+the compiler can reconstruct the mask at the comparison before EXEC changes. `victory_shader::range::build`
 runs both, again where a bound on the index of a register-relative move
 (`v_movrel*`) is proven on the per-lane form, so the move names only the
 registers it can reach. `victory_shader::resource`
