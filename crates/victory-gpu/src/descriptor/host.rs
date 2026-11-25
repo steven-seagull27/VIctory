@@ -939,6 +939,20 @@ fn buffer_srv(
         once!(first, count, element, "buffer view empty or past its host copy");
         return None;
     }
+    if buffer.StructureByteStride > 0
+        && element.is_multiple_of(4)
+        && (first * element).is_multiple_of(16)
+    {
+        // NVIDIA multiplies `rawBufferLoad` byte offsets by `StructureByteStride`,
+        // so expose structured buffers as raw dwords (`host_raw_structured`).
+        // D3D12 requires raw SRVs to start on a 16-byte boundary.
+        buffer.FirstElement = first * (element / 4);
+        buffer.NumElements =
+            (u64::from(count) * (element / 4)).min(u64::from(u32::MAX)) as u32;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -998,6 +1012,17 @@ fn buffer_uav(
     if !in_buffer(&shadow.buffer, first, count, element) {
         once!(first, count, element, "unordered buffer view empty or past its host copy");
         return None;
+    }
+    if buffer.StructureByteStride > 0
+        && element.is_multiple_of(4)
+        && (first * element).is_multiple_of(16)
+    {
+        buffer.FirstElement = first * (element / 4);
+        buffer.NumElements =
+            (u64::from(count) * (element / 4)).min(u64::from(u32::MAX)) as u32;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
     }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.

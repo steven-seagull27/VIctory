@@ -372,6 +372,23 @@ pub fn null_buffer_view() -> u32 {
     host_heap_views() - 2
 }
 
+/// Whether structured buffers in descriptor tables are lowered as raw byte
+/// buffers (matching hosts whose heap converts structured buffer views to raw
+/// so `ResourceHeap` `rawBufferLoad` does not multiply by `StructureByteStride`).
+static HOST_RAW_STRUCTURED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Sets whether structured buffer views are backed by raw descriptors on the
+/// host (`victory-gpu`); call before translating.
+pub fn set_host_raw_structured(on: bool) {
+    HOST_RAW_STRUCTURED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether structured buffer table accesses lower to raw buffer loads/stores.
+pub fn host_raw_structured() -> bool {
+    HOST_RAW_STRUCTURED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How a translation is made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Options {
