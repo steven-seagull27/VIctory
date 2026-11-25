@@ -1354,11 +1354,10 @@ impl<'a> Lanes<'a> {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
-                let any = self.b.and(vcc, exec);
                 if n.ends_with("nz") {
-                    any
+                    vcc
                 } else {
-                    self.b.not(any)
+                    self.b.not(vcc)
                 }
             }
             n => {
@@ -1627,6 +1626,39 @@ mod tests {
         assert_eq!(s.guards[0][0], None, "the compare runs in every lane");
         let g = s.guards[0][1].expect("guard");
         assert!(matches!(s.bools.support(g)[..], [Atom::Lane(_)]));
+    }
+
+    #[test]
+    fn vcc_branch_tests_raw_vcc_without_exec() {
+        for (branch_word, invert) in [(0xBF87_0001_u32, false), (0xBF86_0001_u32, true)] {
+            // v_cmp_eq_u32 vcc, 0, v0
+            // v_cmpx_eq_u32 exec, 0, v1 (narrow EXEC independently of VCC)
+            // s_cbranch_vccnz / s_cbranch_vccz -> target
+            // v_mov_b32 v2, 0
+            // S_ENDPGM
+            let p = build(
+                &[
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0x7DA4_0280, // v_cmpx_eq_u32 exec, 0, v1
+                    branch_word, // s_cbranch_vccnz or s_cbranch_vccz -> +1
+                    0x7E04_0280, // v_mov_b32 v2, 0
+                    S_ENDPGM,
+                ],
+                false,
+            );
+            let s = structure(&p).unwrap();
+            let LaneExit::Branch { when, .. } = s.exits[0] else {
+                panic!("expected branch exit");
+            };
+            let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+            let (lo, hi) = if invert {
+                (Bool::TRUE, Bool::FALSE)
+            } else {
+                (Bool::FALSE, Bool::TRUE)
+            };
+            assert_eq!(s.bools.node(when), Some((Atom::Lane(cmp), lo, hi)));
+            assert_eq!(s.bools.support(when), vec![Atom::Lane(cmp)]);
+        }
     }
 
     #[test]
