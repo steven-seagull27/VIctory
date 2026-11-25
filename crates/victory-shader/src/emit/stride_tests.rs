@@ -749,12 +749,10 @@ fn indexed_buffer_accesses_with_stride_zero_lower_as_raw_while_one_to_three_refu
     }
 }
 
-/// End-to-end hardware + WARP readback of indexed `buffer_load_dword`,
-/// `buffer_store_dword`, and `buffer_atomic_add` on `stride == 0` raw buffers.
-/// Each lane passes a non-zero `vindex` (`lane + 1`) alongside `voffset` /
-/// `offset`, verifying that `vindex` adds 0 to the byte address.
-#[test]
-fn stride_zero_indexed_load_store_and_atomic_address_as_raw_buffers() {
+/// A wave reads, stores and atomically adds through three zero-stride views.
+fn indexed_raw_shader(
+    [load_offset, atomic_offset, value_offset, old_offset]: [u8; 4],
+) -> HostShader {
     const BUFFER_LOAD_DWORD: u32 = 0x0C;
     const BUFFER_STORE_DWORD: u32 = 0x1C;
     const BUFFER_ATOMIC_ADD: u32 = 0x32;
@@ -762,6 +760,10 @@ fn stride_zero_indexed_load_store_and_atomic_address_as_raw_buffers() {
     let atomic = mubuf(BUFFER_ATOMIC_ADD, 4, 1, 16, 4, MUBUF_IDXEN | MUBUF_GLC);
     let store_val = mubuf(BUFFER_STORE_DWORD, 3, 1, 12, 0, MUBUF_OFFEN | MUBUF_IDXEN);
     let store_old = mubuf(BUFFER_STORE_DWORD, 4, 1, 12, 128, MUBUF_OFFEN | MUBUF_IDXEN);
+    let scalar_operand = |inst: [u32; 2], bytes: u8| {
+        // Inline scalar constants 0..=64 use operand codes 128..=192.
+        (inst[1] & 0x00ff_ffff) | ((128 + u32::from(bytes)) << 24)
+    };
     let words = [
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
@@ -776,15 +778,15 @@ fn stride_zero_indexed_load_store_and_atomic_address_as_raw_buffers() {
         0x7E08_0281, // v_mov_b32 v4, 1 (atomic addend)
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
         load[0],
-        load[1], // buffer_load_dword v3, v[1:2], s[8:11], 0 idxen offen offset:4
+        scalar_operand(load, load_offset), // buffer_load_dword v3, v[1:2], s[8:11], soffset idxen offen offset:4
         atomic[0],
-        atomic[1],   // buffer_atomic_add v4, v1, s[16:19], 0 idxen offset:4 glc
-        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        scalar_operand(atomic, atomic_offset), // buffer_atomic_add v4, v1, s[16:19], soffset idxen offset:4 glc
+        0xBF8C_3F70,                           // s_waitcnt vmcnt(0)
         store_val[0],
-        store_val[1], // buffer_store_dword v3, v[1:2], s[12:15], 0 idxen offen
+        scalar_operand(store_val, value_offset), // buffer_store_dword v3, v[1:2], s[12:15], soffset idxen offen
         store_old[0],
-        store_old[1], // buffer_store_dword v4, v[1:2], s[12:15], 0 idxen offen offset:128
-        0xBF81_0000,  // s_endpgm
+        scalar_operand(store_old, old_offset), // buffer_store_dword v4, v[1:2], s[12:15], soffset idxen offen offset:128
+        0xBF81_0000,                           // s_endpgm
     ];
     let used = vec![
         UsedResource {
@@ -818,16 +820,16 @@ fn stride_zero_indexed_load_store_and_atomic_address_as_raw_buffers() {
             slot: 0,
         },
     ];
-    let shader = try_build(&words, vec![param(RootType::Table, 0)], used, 32).expect("build");
-    let data: Vec<u32> = (0..33).map(|k| 1000 + k).collect();
-    let views = [
-        View::Buffer {
-            data: &data,
-            stride: Stride::Raw,
-        },
-        View::RawUav(64),
-        View::RawUav(4),
-    ];
+    try_build(&words, vec![param(RootType::Table, 0)], used, 32).expect("build")
+}
+
+/// Each lane supplies a nonzero index. With zero stride it contributes
+/// nothing, while the scalar, vector and instruction offsets still add.
+#[test]
+fn stride_zero_indexed_load_store_and_atomic_address_as_raw_buffers() {
+    // The second output has untouched words before, between and after its store ranges.
+    let cases = [([0; 4], 64), ([12, 8, 4, 8], 68)]
+        .map(|(bytes, output_words)| (indexed_raw_shader(bytes), bytes, output_words));
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -837,28 +839,52 @@ fn stride_zero_indexed_load_store_and_atomic_address_as_raw_buffers() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let (root, pso) = host
-            .compute_pipeline(&shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
-                    views: &views,
-                    samplers: &[],
-                    groups: [1, 1, 1],
+        for (shader, scalar_bytes, output_words) in &cases {
+            let [load, atomic, stored, old] = scalar_bytes.map(|n| usize::from(n) / 4);
+            // Load/atomic have a 4-byte immediate. The second store has a
+            // 128-byte immediate. The vector offsets advance one dword per lane.
+            let first_input = 1 + load;
+            let first_old = 32 + old;
+            let data: Vec<u32> = (0..first_input + 32).map(|k| 1000 + k as u32).collect();
+            let views = [
+                View::Buffer {
+                    data: &data,
+                    stride: Stride::Raw,
                 },
-            )
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        let want_loaded: Vec<u32> = (1..33).map(|k| 1000 + k).collect();
-        assert_eq!(out[0][..32], want_loaded, "{label}: loaded");
-        let mut old = out[0][32..64].to_vec();
-        old.sort_unstable();
-        assert_eq!(old, (0..32).collect::<Vec<_>>(), "{label}: atomic glc");
-        assert_eq!(out[1], [0, 32, 0, 0], "{label}: atomic sum");
+                View::RawUav(*output_words),
+                View::RawUav(4),
+            ];
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let mut out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            // Atomics return the original values in any lane order.
+            out[0][first_old..first_old + 32].sort_unstable();
+            let mut expected = vec![0; *output_words as usize];
+            expected[stored..stored + 32].copy_from_slice(&data[first_input..]);
+            for (dst, value) in expected[first_old..first_old + 32].iter_mut().zip(0..32) {
+                *dst = value;
+            }
+            let mut counters = [0; 4];
+            counters[1 + atomic] = 32;
+            assert_eq!(out[0], expected, "{label}, scalar offsets {scalar_bytes:?}");
+            assert_eq!(out[1], counters, "{label}: atomic sum");
+            eprintln!(
+                "{label}, scalar offsets {scalar_bytes:?}: {output_words} output words and 4 counters matched"
+            );
+        }
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
