@@ -115,8 +115,7 @@ pub(crate) struct Shader {
     /// handles, once a write through a view is marked.
     pub view_marks: Option<V>,
     pub view_writes: Option<V>,
-    /// The heap index of each handle of an unordered buffer view (writes
-    /// through it are marked by the index's view-mark entry).
+    /// Heap slots used for unordered-buffer write marks and raw SRV offsets.
     pub view_index: std::collections::HashMap<V, V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
@@ -538,7 +537,8 @@ impl Shader {
         );
         let h = self.annotate(block, h, props.0, props.1);
         // Unordered typed, raw and structured buffers (kinds 10-12).
-        if !sampler && props.0 & 0x1000 != 0 && (10..=12).contains(&(props.0 & 0xFF)) {
+        let unordered = props.0 & 0x1000 != 0 && (10..=12).contains(&(props.0 & 0xFF));
+        if !sampler && (unordered || (props.0 == 11 && super::host_raw_structured())) {
             self.view_index.insert(h, index);
         }
         h

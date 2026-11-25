@@ -378,6 +378,10 @@ pub fn null_buffer_view() -> u32 {
 static HOST_RAW_STRUCTURED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// In the host view-stride dword, the top two bits give the leading dwords
+/// in a raw SRV whose structured view starts between 16-byte boundaries.
+pub const VIEW_PREFIX_SHIFT: u32 = 30;
+
 /// Sets whether structured buffer views are backed by raw descriptors on the
 /// host (`victory-gpu`); call before translating.
 pub fn set_host_raw_structured(on: bool) {

@@ -83,7 +83,7 @@ fn key(translator: &str, encoding: &[u8], limit: u32, heap_views: u32, raw_struc
         h.update(&heap_views.to_le_bytes());
     }
     if raw_structured {
-        h.update(b"host raw structured");
+        h.update(b"host raw structured; SRV prefix in stride entry v1");
     }
     *h.finalize().as_bytes()
 }

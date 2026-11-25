@@ -403,12 +403,12 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let (kept, mark) = make_marked(view, self.cpu(index));
+        let (kept, mark, prefix) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
-        self.set_stride(index, Some(view));
+        self.set_stride(index, Some(view), prefix);
         self.set_mark(index, mark);
     }
 
@@ -477,7 +477,7 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
-        self.set_stride(index, None);
+        self.set_stride(index, None, 0);
         self.set_mark(index, None);
         if index < self.count {
             self.viewed.set(index, None, false);
@@ -486,8 +486,10 @@ impl HostHeap {
 
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
     /// for slot `index` in the view-stride table.
-    fn set_stride(&self, index: u32, view: Option<&View>) {
-        self.write_stride(index, view.map_or(0, view_stride));
+    fn set_stride(&self, index: u32, view: Option<&View>, prefix: u32) {
+        let stride = view.map_or(0, view_stride);
+        let entry = stride | ((prefix / 4) << victory_shader::emit::VIEW_PREFIX_SHIFT);
+        self.write_stride(index, entry);
     }
 
     fn write_stride(&self, index: u32, stride: u32) {
@@ -688,7 +690,6 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
-            self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views
             // are made when written.
@@ -698,11 +699,12 @@ impl HostHeap {
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
             made[index as usize] = if later { 0 } else { key };
-            let (kept, mark) = if later {
-                (None, None)
+            let (kept, mark, prefix) = if later {
+                (None, None, 0)
             } else {
                 make_marked(&view, self.cpu(index))
             };
+            self.set_stride(index, Some(&view), prefix);
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -910,6 +912,7 @@ fn buffer_srv(
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    prefix: &mut u32,
 ) -> Option<Kept> {
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
@@ -939,16 +942,19 @@ fn buffer_srv(
         once!(first, count, element, "buffer view empty or past its host copy");
         return None;
     }
-    if buffer.StructureByteStride > 0
-        && element.is_multiple_of(4)
-        && (first * element).is_multiple_of(16)
+    let start_byte = first * element;
+    let lead = start_byte % 16;
+    let bytes = u64::from(count) * element;
+    if buffer.StructureByteStride > 0 && element.is_multiple_of(4)
+        && (lead == 0 || bytes <= u64::from(u32::MAX) - lead)
     {
-        // NVIDIA multiplies `rawBufferLoad` byte offsets by `StructureByteStride`,
-        // so expose structured buffers as raw dwords (`host_raw_structured`).
-        // D3D12 requires raw SRVs to start on a 16-byte boundary.
-        buffer.FirstElement = first * (element / 4);
+        // A raw SRV starts on a 16-byte boundary. Include the leading dwords
+        // in that SRV and record them for translated reads of this heap slot.
+        // Keep the original end and the resource shared with overlapping UAVs.
+        buffer.FirstElement = (start_byte - lead) / 4;
         buffer.NumElements =
-            (u64::from(count) * (element / 4)).min(u64::from(u32::MAX)) as u32;
+            ((bytes + lead) / 4).min(u64::from(u32::MAX)) as u32;
+        *prefix = lead as u32;
         buffer.StructureByteStride = 0;
         buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -1043,10 +1049,11 @@ thread_local! {
 /// [`make`], and the view-mark entry of the view if it is an unordered
 /// buffer view whose writes shaders mark (`victory_shader::emit`, "Write
 /// marks").
-fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>) {
+fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>, u32) {
     MARK.with(|m| m.set(None));
-    let kept = make(view, at);
-    (kept, MARK.with(std::cell::Cell::take))
+    let mut prefix = 0;
+    let kept = make(view, at, &mut prefix);
+    (kept, MARK.with(std::cell::Cell::take), prefix)
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -1153,12 +1160,12 @@ fn typed_store(format: u32) -> bool {
 /// Makes the host descriptor for `view` at `at` (in any host view heap):
 /// the host resource it views, if it can.
 pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
-    make(view, at).flatten().map(|k| k.0)
+    make(view, at, &mut 0).flatten().map(|k| k.0)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
-fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, prefix: &mut u32) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
@@ -1182,7 +1189,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     },
                 },
             };
-            buffer_srv(address, bytes, desc, at)
+            buffer_srv(address, bytes, desc, at, prefix)
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -1207,7 +1214,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
-                buffer_srv(data as u64, len, srv_desc(desc), at)
+                buffer_srv(data as u64, len, srv_desc(desc), at, prefix)
             } else {
                 None
             }
@@ -1266,7 +1273,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+                return make(&view, at, prefix);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -1283,7 +1290,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if *unordered {
                 buffer_uav(address, len, uav_desc(words), at)
             } else {
-                buffer_srv(address, len, srv_desc(words), at)
+                buffer_srv(address, len, srv_desc(words), at, prefix)
             }
         }
     }

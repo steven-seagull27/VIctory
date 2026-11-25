@@ -1714,6 +1714,26 @@ impl<'a> Lower<'a> {
                 Some(at) => self.s.m.bin(self.cur, Bin::Add, off, at),
                 None => off,
             };
+            if !write && props.0 == 11 && !matches!(src, Source::Built { .. })
+                && let Some((index, prefix)) = self.srv_prefix(h)
+            {
+                let c = self.cur;
+                let shifted = self.s.m.bin(c, Bin::Add, off, prefix);
+                // DXIL addresses are dwords containing byte offsets. A wide
+                // scalar load may also add offsets for its individual reads.
+                // Keep an addition that carries out of an offset away from
+                // the leading bytes the raw descriptor includes for alignment.
+                let last = self.s.m.i32(u32::MAX - (bytes - 1));
+                let room = self.s.m.bin(c, Bin::Sub, last, prefix);
+                let carries = self.s.m.cmp(c, pred::IUGT, off, room);
+                let zero = self.s.m.i32(0);
+                let has_prefix = self.s.m.cmp(c, pred::NE, prefix, zero);
+                let redirected = self.s.m.bin(c, Bin::And, has_prefix, carries);
+                let null = self.s.m.i32(super::null_buffer_view());
+                let slot = self.s.m.select(c, redirected, null, index);
+                let h = self.s.heap_handle(c, slot, false, true, props);
+                return Ok((h, shifted));
+            }
             return Ok((h, off));
         };
         // The hardware adds the 32-bit offset to the 48-bit base.
@@ -4169,6 +4189,11 @@ impl<'a> Lower<'a> {
             }
             None => {
                 let len = field(self, 0);
+                let len = if props.0 == 11 && let Some((_, prefix)) = self.srv_prefix(h) {
+                    self.s.m.bin(c, Bin::Sub, len, prefix)
+                } else {
+                    len
+                };
                 let len = match div {
                     Some(s) => {
                         let d = self.s.m.i32(s);
@@ -4356,14 +4381,37 @@ impl<'a> Lower<'a> {
         self.end_guarded(outer, &[]);
     }
 
-    /// The byte stride of the buffer view at heap index `index`, from the
-    /// view-stride table (`t`[`VIEW_STRIDES`]).
-    fn stride_at(&mut self, index: V) -> V {
+    /// The host's stride and raw SRV prefix for one heap slot.
+    fn view_entry(&mut self, index: V) -> V {
         let c = self.cur;
         let four = self.s.m.i32(4);
         let at = self.s.m.bin(c, Bin::Mul, index, four);
         let table = self.s.root_srv_handle(VIEW_STRIDES);
         self.raw_dword(table, at)
+    }
+
+    fn stride_at(&mut self, index: V) -> V {
+        let entry = self.view_entry(index);
+        if super::host_raw_structured() {
+            let mask = self.s.m.i32((1 << super::VIEW_PREFIX_SHIFT) - 1);
+            self.s.m.bin(self.cur, Bin::And, entry, mask)
+        } else {
+            entry
+        }
+    }
+
+    /// The descriptor index and the distance in bytes from its aligned
+    /// host base to the beginning requested by the game.
+    fn srv_prefix(&mut self, h: V) -> Option<(V, V)> {
+        if !super::host_raw_structured() {
+            return None;
+        }
+        let index = *self.s.view_index.get(&h)?;
+        let entry = self.view_entry(index);
+        let shift = self.s.m.i32(super::VIEW_PREFIX_SHIFT);
+        let words = self.s.m.bin(self.cur, Bin::LShr, entry, shift);
+        let two = self.s.m.i32(2);
+        Some((index, self.s.m.bin(self.cur, Bin::Shl, words, two)))
     }
 
     /// Title memory at a raw GPU address (decision 0005: the unified-memory
@@ -4800,22 +4848,7 @@ impl<'a> Lower<'a> {
             Source::Phi { .. } => return Err(WHY),
             _ => self.lane_heap_index(src, false)?,
         };
-        let c = self.cur;
-        let four = self.s.m.i32(4);
-        let at = self.s.m.bin(c, Bin::Mul, index, four);
-        let table = self.s.root_srv_handle(VIEW_STRIDES);
-        let iu = self.s.m.undef(self.s.t.i32);
-        let mask = self.s.m.i8(1);
-        let r = self.s.op(
-            c,
-            "rawBufferLoad.f32",
-            Attr::ReadOnly,
-            self.s.t.res_ret,
-            139,
-            &[table, at, iu, mask, four],
-        );
-        let x = self.s.m.extract(c, r, 0);
-        Ok(self.as_int(x))
+        Ok(self.stride_at(index))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
