@@ -13,6 +13,10 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+#[cfg(test)]
+#[path = "structured_srv_readbacks/mod.rs"]
+mod structured_srv_readbacks;
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
