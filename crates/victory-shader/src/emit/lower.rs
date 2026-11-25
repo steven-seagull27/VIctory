@@ -595,7 +595,16 @@ impl<'a> Lower<'a> {
                     x.st.bools
                         .support(g)
                         .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+                        .any(|a| match a {
+                            Atom::Opaque(_) | Atom::Constant(_) => true,
+                            Atom::VccNonzero(lo, hi) => {
+                                cs.threads != [1, 1, 1]
+                                    && [lo, hi].iter().any(|v| {
+                                        x.st.masks.contains_key(v) || x.st.highs.contains_key(v)
+                                    })
+                            }
+                            _ => false,
+                        })
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
@@ -1837,12 +1846,17 @@ impl<'a> Lower<'a> {
                 self.balloting.remove(&lo);
                 let bit = bit?;
                 let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self
-                    .s
-                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let xy = if matches!(&self.x.native.io, StageIo::Cs(cs) if cs.threads == [1, 1, 1]) {
+                    // This group contains only guest lane zero.
+                    (self.s.m.cast(at, Cast::ZExt, bit, i32t), self.s.m.i32(0))
+                } else {
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let r = self
+                        .s
+                        .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+                    self.s.flags |= flags::WAVE_OPS;
+                    (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1))
+                };
                 self.ballots.insert(lo, xy);
                 xy
             }
@@ -2572,6 +2586,18 @@ impl<'a> Lower<'a> {
                 }
                 Val::Missing(w) => Err(w),
             },
+            Atom::VccNonzero(lo, hi) => {
+                self.check_vcc_joins(lo, hi)?;
+                let low = self.vcc_word(lo)?;
+                let bits = if hi == lo {
+                    low
+                } else {
+                    let high = self.vcc_word(hi)?;
+                    self.s.m.bin(at, Bin::Or, low, high)
+                };
+                let zero = self.s.m.i32(0);
+                Ok(self.s.m.cmp(at, pred::NE, bits, zero))
+            }
             Atom::Phi(id) => {
                 if let Some(&v) = self.mask_phis.get(&id) {
                     return Ok(v);
@@ -2614,6 +2640,77 @@ impl<'a> Lower<'a> {
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
         }
+    }
+
+    /// Scalar writes can set bits for lanes outside EXEC or even outside a
+    /// partially filled wave. Read their dword as written. For a VALU result,
+    /// take the ballot at its definition, before any subsequent divergence.
+    fn vcc_word(&mut self, v: Value) -> Result<V, Why> {
+        let st = self.x.st;
+        let mask = st.masks.contains_key(&v) || st.highs.contains_key(&v);
+        if !mask || matches!(self.vals.get(&v), Some(Val::I32(_) | Val::Bit(_))) {
+            return self.i32_of(v);
+        }
+        let singleton = matches!(&self.x.native.io, StageIo::Cs(cs) if cs.threads == [1, 1, 1]);
+        if self.mask_data != MaskData::Console || !singleton && self.s.wave_size.is_none() {
+            return Err("a scalar VCC branch requiring the guest wave width");
+        }
+        // A ballot cannot include lanes on another host control-flow path.
+        // The guest compare's own EXEC may already exclude them.
+        let low = st.highs.get(&v).copied().unwrap_or(v);
+        if let (Some(&block), Some(&mask)) = (self.def_block.get(&low), st.masks.get(&low))
+            && st.active.contains(&low)
+            && !singleton
+            && st.bools.support(st.reach[block]).iter().any(|a| {
+                !matches!(a, Atom::Uniform(_) | Atom::VccNonzero(..))
+            })
+            && st.bools.meet(&[(mask, true), (st.reach[block], false)])
+        {
+            return Err("a scalar VCC branch with mask bits outside its producing path");
+        }
+        self.mask_dword(v)
+    }
+
+    /// A normal DXIL phi can select a different SGPR value in each lane at a
+    /// join of the per-lane CFG. That phi cannot represent a scalar VCC word.
+    fn check_vcc_joins(&self, lo: Value, hi: Value) -> Result<(), Why> {
+        if matches!(&self.x.native.io, StageIo::Cs(cs) if cs.threads == [1, 1, 1]) {
+            return Ok(());
+        }
+        let st = self.x.st;
+        let mut values = vec![lo, hi];
+        let mut seen = HashSet::new();
+        while let Some(v) = values.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            if let Some(&(b, i)) = self.phi_at.get(&v) {
+                let block = &self.x.p.blocks[b];
+                for (&pred, &arg) in block.preds.iter().zip(&block.phis[i].args) {
+                    let edge = self.lane_edge(pred, b);
+                    if !st.bools.meet(&edge) {
+                        continue;
+                    }
+                    for (cond, _) in edge {
+                        for atom in st.bools.support(cond) {
+                            match atom {
+                                Atom::Uniform(scc) => values.push(scc),
+                                Atom::VccNonzero(low, high) => values.extend([low, high]),
+                                _ => return Err("a scalar VCC branch depending on a divergent scalar join"),
+                            }
+                        }
+                    }
+                    values.push(arg);
+                }
+            } else if let Some(inst) = self.def_inst(v) {
+                // The lanes' vector inputs may legitimately differ. A scalar
+                // input (including an enclosing EXEC mask) must still be valid.
+                values.extend(inst.reads.iter().filter_map(|&(r, value)| {
+                    matches!(r, Reg::S(_) | Reg::Scc).then_some(value)
+                }));
+            }
+        }
+        Ok(())
     }
 
     /// The bit of lane `lane` in the mask `lo`, `hi`.
@@ -10424,6 +10521,12 @@ impl<'a> Lower<'a> {
                 continue;
             }
             let v = match atom {
+                Atom::VccNonzero(lo, hi) => {
+                    if tainted.contains(&lo) || tainted.contains(&hi) {
+                        return true;
+                    }
+                    None
+                }
                 Atom::Lane(v)
                 | Atom::Uniform(v)
                 | Atom::Phi(v)
@@ -10459,6 +10562,18 @@ impl<'a> Lower<'a> {
         let (atom, lo, hi) = self.x.st.bools.node(b).expect("not a constant");
         let v = match atom {
             Atom::Lane(v) | Atom::Uniform(v) => Some(v),
+            Atom::VccNonzero(low, high)
+                if matches!(&self.x.native.io, StageIo::Cs(cs) if cs.threads == [1, 1, 1]) =>
+            {
+                // Only a compare with no remaining EXEC guard in a one-lane
+                // group has exactly its lane's value as the whole VCC result.
+                self.x.st.mask_bits(low, (low != high).then_some(high))
+                    .and_then(|m| self.x.st.bools.node(m))
+                    .and_then(|n| match n {
+                        (Atom::Lane(v), Bool::FALSE, Bool::TRUE) => Some(v),
+                        _ => None,
+                    })
+            }
             _ => None,
         };
         let r = match v.and_then(|v| self.compared(env, v)) {

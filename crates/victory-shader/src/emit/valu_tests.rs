@@ -2281,3 +2281,34 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+/// A scalar write can set VCC bits for lanes outside this one-thread group.
+#[test]
+fn vcc_branches_read_all_bits_of_a_scalar_mask_in_a_partial_group() {
+    let inputs: Vec<_> = [0, 1, 0x10, 0x8000_0000, 0x8000_0001, u32::MAX]
+        .into_iter()
+        .flat_map(|mask| [[0, mask, 0, 0], [1, mask, 0, 0]])
+        .collect();
+    for (branch, take_if_nonzero) in [(0xbf86_0001, false), (0xbf87_0001, true)] {
+        let shader = build_valu_cs(&[
+            s_mov_b32(16, 139),  // taken path keeps s16 = 11
+            0x7da4_0280,         // v_cmpx_eq_u32 exec, 0, v1 (s0)
+            s_mov_b32(106, 1),   // vcc_lo = the runtime mask from s1
+            branch,              // s_cbranch_vccz / s_cbranch_vccnz +1
+            s_mov_b32(16, 151),  // fallthrough sets s16 = 23
+            s_mov_b32(126, 193), // restore EXEC before the UAV write
+            vop1(1, 0, sgpr(16)),
+        ]);
+        run_cases(&shader, &inputs, |adapter, _, args, got| {
+            let expected = if (args[1] != 0) == take_if_nonzero {
+                11
+            } else {
+                23
+            };
+            assert_eq!(
+                got, expected,
+                "{adapter}: branch {branch:#x}, inputs {args:?}"
+            );
+        });
+    }
+}
