@@ -349,7 +349,8 @@ fn check_narrowed_exec_dpp(lane_varying: bool) {
                     [37, base, special, base]
                 };
                 assert_eq!(out[0].len(), 4 * threads as usize);
-                let mismatches = out[0].chunks_exact(4).filter(|x| *x != expected).count();
+                let (records, _) = out[0].as_chunks::<4>();
+                let mismatches = records.iter().filter(|&&record| record != expected).count();
                 bad += mismatches;
                 eprintln!(
                     "{label}: wave{threads}, {mismatches}/{threads} mismatched records; expected {expected:?}; first two {:?}",

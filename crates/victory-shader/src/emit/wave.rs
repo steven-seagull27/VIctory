@@ -78,8 +78,8 @@ impl Op {
 pub(crate) enum Sym {
     Unknown,
     K(u32),
-    /// The lane's own value of a VGPR value from before the section.
-    Own(Value),
+    /// A named lane of a VGPR value from before the section.
+    Lane(Value, u32),
     /// A uniform value from before the section.
     Uni(Value),
     /// `op` over `lanes` of `mask ? src : ident` (`op` none: one lane).
@@ -109,6 +109,8 @@ pub(crate) enum Sym {
 pub(crate) enum Shape {
     K(u32),
     Value(Value),
+    /// Every lane takes the same pre-section VGPR lane.
+    Lane(Value, u32),
     /// The lane's own `mask ? src : ident`.
     Masked(Value, Value, u32),
     /// `op` over every lane.
@@ -418,7 +420,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> (HashMap<Value, Shape>, 
                     Some(x) => vec
                         .get(&x)
                         .cloned()
-                        .unwrap_or_else(|| (0..wave).map(|_| Sym::Own(x)).collect()),
+                        .unwrap_or_else(|| (0..wave).map(|lane| Sym::Lane(x, lane)).collect()),
                     None => one(Sym::Unknown),
                 },
                 Operand::Scalar { code, .. } if code != NULL => match inst.read(Reg::S(code)) {
@@ -536,7 +538,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> (HashMap<Value, Shape>, 
                 let b = src(1).unwrap_or_default();
                 (0..wave as usize)
                     .map(|l| match (a[l], b.get(l).copied(), mask) {
-                        (Sym::K(ident), Some(Sym::Own(x)), Some(m)) if masked.contains(&m) => {
+                        (Sym::K(ident), Some(Sym::Lane(x, lane)), Some(m))
+                            if lane == l as u32 && masked.contains(&m) =>
+                        {
                             Sym::Red {
                                 op: None,
                                 src: x,
@@ -683,7 +687,8 @@ fn shapes(
     let mut out = HashMap::new();
     let single = |s: Sym| match s {
         Sym::K(k) => Some(Shape::K(k)),
-        Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
+        Sym::Uni(x) => Some(Shape::Value(x)),
+        Sym::Lane(x, lane) => Some(Shape::Lane(x, lane)),
         Sym::Red {
             op: Some(op),
             src,
@@ -716,6 +721,14 @@ fn shapes(
 
 fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     let first = lanes[0];
+    if let Sym::Lane(value, 0) = first
+        && lanes
+            .iter()
+            .enumerate()
+            .all(|(lane, &s)| s == Sym::Lane(value, lane as u32))
+    {
+        return Some(Shape::Value(value));
+    }
     let own = |l: usize, s: Sym| match s {
         Sym::Red {
             op: None,
@@ -734,7 +747,8 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     if lanes.iter().all(|&s| s == first) {
         return match first {
             Sym::K(k) => Some(Shape::K(k)),
-            Sym::Uni(x) | Sym::Own(x) => Some(Shape::Value(x)),
+            Sym::Uni(x) => Some(Shape::Value(x)),
+            Sym::Lane(x, lane) => Some(Shape::Lane(x, lane)),
             Sym::Red {
                 op: Some(op),
                 src,
@@ -869,6 +883,18 @@ mod tests {
             fi: false,
         };
         assert_eq!(dpp_lane(swap, 8), Some((9, false, true)));
+    }
+
+    #[test]
+    fn incoming_vgpr_keeps_its_source_lane() {
+        let value = Value(1);
+        let all = u64::from(u32::MAX);
+        let mut lanes: Vec<_> = (0..32).map(|lane| Sym::Lane(value, lane)).collect();
+        assert_eq!(per_lane(&lanes, all), Some(Shape::Value(value)));
+        lanes.swap(1, 2);
+        assert_eq!(per_lane(&lanes, all), None);
+        lanes.fill(Sym::Lane(value, 2));
+        assert_eq!(per_lane(&lanes, all), Some(Shape::Lane(value, 2)));
     }
 
     #[test]

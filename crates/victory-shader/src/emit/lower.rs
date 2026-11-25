@@ -1048,7 +1048,7 @@ impl<'a> Lower<'a> {
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
-                match shape.ok_or(unknown).and_then(|sh| self.shape(sh)) {
+                match shape.ok_or(unknown).and_then(|sh| self.shape(sh, b)) {
                     Ok(x) => Val::I32(x),
                     Err(why) => Val::Missing(why),
                 }
@@ -1063,11 +1063,32 @@ impl<'a> Lower<'a> {
     /// host's active lanes: the console's result with console lanes; on
     /// another wave size, what the HLSL wave operation the console compiler
     /// expanded gives on that wave.
-    fn shape(&mut self, shape: super::wave::Shape) -> Result<V, Why> {
+    fn shape(&mut self, shape: super::wave::Shape, block: usize) -> Result<V, Why> {
         use super::wave::{Op, Shape};
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
+            Shape::Lane(v, lane) => {
+                // A host wave read requires the source lane to be present.
+                // Full compute waves enter this block together. A branch,
+                // loop back-edge or partial wave can leave that lane out.
+                let full_waves = self
+                    .s
+                    .threads
+                    .and_then(|dims| dims.into_iter().try_fold(1u32, u32::checked_mul))
+                    .is_some_and(|n| n != 0 && n.is_multiple_of(self.wave()));
+                if block != 0
+                    || !self.x.p.blocks[0].preds.is_empty()
+                    || !self.console_lanes
+                    || !full_waves
+                {
+                    return Err("a whole-wave section reading a fixed VGPR lane that may be absent");
+                }
+                self.cross_lane(false)?;
+                let x = self.i32_of(v)?;
+                let at = self.s.m.i32(lane);
+                return Ok(self.read_lane(x, at));
+            }
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
@@ -10132,6 +10153,27 @@ mod tests {
             S_ENDPGM,
         ];
         lowers(&words, 0x8001).unwrap();
+    }
+
+    #[test]
+    fn a_fixed_lane_read_in_a_whole_wave_section_refuses_a_partial_group() {
+        let words = [
+            0xbe88_3dc1, // s_or_saveexec_b32 s8, -1
+            0xd760_0014,
+            256 | 130 << 9, // v_readlane_b32 s20, v0, 2
+            0xbefe_0308, // s_mov_b32 exec_lo, s8
+            0x7e04_0214, // v_mov_b32 v2, s20
+            0xd834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        assert!(matches!(
+            lowers(&words, 1 << 15),
+            Err(crate::ShaderError::Unsupported {
+                what: "a whole-wave section reading a fixed VGPR lane that may be absent",
+                ..
+            })
+        ));
     }
 
     fn perm_features(selector: u32) -> u64 {
