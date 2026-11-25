@@ -993,7 +993,13 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 fn write_address(data: usize, index: usize, view: Option<&View>) {
     let words = view.and_then(texture_words).unwrap_or_else(|| {
         view.and_then(buffer_view).map_or([0; 4], |v| {
-            [v.address as u32, (v.address >> 32) as u32 & 0xFFFF, v.records, v.word3]
+            [
+                v.address as u32,
+                (v.address >> 32) as u32 & 0xFFFF,
+                v.records,
+                // RDNA2 buffer FORMAT occupies dword 3 bits 18:12.
+                u32::from(v.format) << 12,
+            ]
         })
     });
     // SAFETY: the mapped view addresses hold 16 bytes per title slot.
@@ -1069,8 +1075,68 @@ struct BufferView {
     address: u64,
     bytes: u64,
     records: u32,
-    // TODO: encode the guest format/type word from the view description.
-    word3: u32,
+    format: u8,
+}
+
+/// GFX10 BUF_FMT, as in AMD PAL's gfx10_3.yaml and gfx9_plus_merged_enum.h.
+/// Untyped views use PAL's CreateUntypedBufferViewSrds convention. Formats
+/// without a known buffer encoding get BUF_FMT_INVALID.
+fn buffer_format(format: DXGI_FORMAT, stride: u32, raw: bool) -> u8 {
+    let format = match (format, stride, raw) {
+        (DXGI_FORMAT_R32_TYPELESS, 0, true) | (DXGI_FORMAT_UNKNOWN, 1.., false) => {
+            DXGI_FORMAT_R32_UINT
+        }
+        (typed, 0, false) => typed,
+        _ => return 0,
+    };
+    match format {
+        DXGI_FORMAT_R8_UNORM | DXGI_FORMAT_A8_UNORM => 1,
+        DXGI_FORMAT_R8_SNORM => 2,
+        DXGI_FORMAT_R8_UINT => 5,
+        DXGI_FORMAT_R8_SINT => 6,
+        DXGI_FORMAT_R16_UNORM => 7,
+        DXGI_FORMAT_R16_SNORM => 8,
+        DXGI_FORMAT_R16_UINT => 11,
+        DXGI_FORMAT_R16_SINT => 12,
+        DXGI_FORMAT_R16_FLOAT => 13,
+        DXGI_FORMAT_R8G8_UNORM => 14,
+        DXGI_FORMAT_R8G8_SNORM => 15,
+        DXGI_FORMAT_R8G8_UINT => 18,
+        DXGI_FORMAT_R8G8_SINT => 19,
+        DXGI_FORMAT_R32_UINT => 20,
+        DXGI_FORMAT_R32_SINT => 21,
+        DXGI_FORMAT_R32_FLOAT => 22,
+        DXGI_FORMAT_R16G16_UNORM => 23,
+        DXGI_FORMAT_R16G16_SNORM => 24,
+        DXGI_FORMAT_R16G16_UINT => 27,
+        DXGI_FORMAT_R16G16_SINT => 28,
+        DXGI_FORMAT_R16G16_FLOAT => 29,
+        // PAL names packed components from the high bits down.
+        DXGI_FORMAT_R11G11B10_FLOAT => 36,
+        DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM => 50,
+        DXGI_FORMAT_R10G10B10A2_UINT => 54,
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8X8_UNORM => {
+            56
+        }
+        DXGI_FORMAT_R8G8B8A8_SNORM => 57,
+        DXGI_FORMAT_R8G8B8A8_UINT => 60,
+        DXGI_FORMAT_R8G8B8A8_SINT => 61,
+        DXGI_FORMAT_R32G32_UINT => 62,
+        DXGI_FORMAT_R32G32_SINT => 63,
+        DXGI_FORMAT_R32G32_FLOAT => 64,
+        DXGI_FORMAT_R16G16B16A16_UNORM => 65,
+        DXGI_FORMAT_R16G16B16A16_SNORM => 66,
+        DXGI_FORMAT_R16G16B16A16_UINT => 69,
+        DXGI_FORMAT_R16G16B16A16_SINT => 70,
+        DXGI_FORMAT_R16G16B16A16_FLOAT => 71,
+        DXGI_FORMAT_R32G32B32_UINT => 72,
+        DXGI_FORMAT_R32G32B32_SINT => 73,
+        DXGI_FORMAT_R32G32B32_FLOAT => 74,
+        DXGI_FORMAT_R32G32B32A32_UINT => 75,
+        DXGI_FORMAT_R32G32B32A32_SINT => 76,
+        DXGI_FORMAT_R32G32B32A32_FLOAT => 77,
+        _ => 0,
+    }
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
@@ -1097,7 +1163,7 @@ fn buffer_view(view: &View) -> Option<BufferView> {
     if words[1] != 1 {
         return None;
     }
-    let (first, count, element, raw) = if unordered {
+    let (first, count, element, stride, raw) = if unordered {
         let desc = uav_desc(words);
         // SAFETY: the dimension selects the Buffer union member.
         let buffer = unsafe { desc.Anonymous.Buffer };
@@ -1109,13 +1175,16 @@ fn buffer_view(view: &View) -> Option<BufferView> {
         } else {
             crate::resource::element(desc.Format.0 as u32)?.0
         };
-        (buffer.FirstElement, buffer.NumElements, element, raw)
+        (buffer.FirstElement, buffer.NumElements, element, buffer.StructureByteStride, raw)
     } else {
         let desc = srv_desc(words);
         // SAFETY: the dimension selects the Buffer union member.
         let buffer = unsafe { desc.Anonymous.Buffer };
         let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-        (buffer.FirstElement, buffer.NumElements, element_size(&desc), raw)
+        (
+            buffer.FirstElement, buffer.NumElements, element_size(&desc),
+            buffer.StructureByteStride, raw,
+        )
     };
     if element == 0 {
         return None;
@@ -1127,7 +1196,8 @@ fn buffer_view(view: &View) -> Option<BufferView> {
         // D3D12 counts raw views in dwords; the shader reads a byte count.
         // Cap larger ranges at the largest byte bound the field can hold.
         records: if raw { count.saturating_mul(4) } else { count },
-        word3: words[3],
+        // words[0] is the title's API format, before any host format substitution.
+        format: buffer_format(DXGI_FORMAT(words[0] as i32), stride, raw),
     })
 }
 
@@ -1984,6 +2054,49 @@ mod tests {
         unsafe { std::ptr::write_bytes((start + 32) as *mut u8, 0, 32) };
         host.sync_slots(0, 4, start, 32);
         assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
+    }
+
+    #[test]
+    fn buffer_formats_use_rdna2_packing_and_untyped_view_kinds() {
+        let cases = [
+            (DXGI_FORMAT_R11G11B10_FLOAT, 0, false, 36),
+            (DXGI_FORMAT_R10G10B10A2_UNORM, 0, false, 50),
+            (DXGI_FORMAT_R10G10B10A2_UINT, 0, false, 54),
+            (DXGI_FORMAT_R32G32B32_FLOAT, 0, false, 74),
+            (DXGI_FORMAT_R32_TYPELESS, 0, true, 20),
+            (DXGI_FORMAT_UNKNOWN, 12, false, 20),
+            (DXGI_FORMAT_R32_TYPELESS, 0, false, 0),
+            (DXGI_FORMAT_UNKNOWN, 0, false, 0),
+            (DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 0, false, 0),
+            (DXGI_FORMAT_R9G9B9E5_SHAREDEXP, 0, false, 0),
+        ];
+        for (format, stride, raw, expected) in cases {
+            assert_eq!(buffer_format(format, stride, raw), expected, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn descriptor_word_3_uses_the_format_instead_of_api_padding_or_first_element() {
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        // API dword 3 is SRV padding or the high half of UAV FirstElement.
+        // Either may contain a value unrelated to the format or channel selects.
+        for (unordered, format, expected) in [
+            (false, DXGI_FORMAT_R8G8_SNORM, 15),
+            (true, DXGI_FORMAT_R16G16B16A16_FLOAT, 71),
+            (false, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 0),
+        ] {
+            let mut words = [0; 16];
+            words[0] = format.0 as u32;
+            words[1] = 1; // buffer dimension
+            words[3] = 0x1234;
+            words[if unordered { 4 } else { 6 }] = 3;
+            let mut entry = [u32::MAX; 4];
+            let view = View::Placed(unordered, resource, words);
+            write_address(entry.as_mut_ptr() as usize, 0, Some(&view));
+            assert_eq!(entry[2], 3);
+            assert_eq!(entry[3], expected << 12);
+        }
     }
 
     #[test]
