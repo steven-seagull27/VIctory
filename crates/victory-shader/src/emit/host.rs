@@ -232,25 +232,44 @@ fn wait_for_completion(
     fence: &ID3D12Fence,
     value: u64,
 ) -> Result<(), String> {
-    // SAFETY: the device, queue and fence are live for the whole call.
-    unsafe {
-        queue.Signal(fence, value).map_err(err)?;
-        loop {
-            if let Err(e) = device.GetDeviceRemovedReason() {
-                return Err(format!("device removed: {}", err(e)));
-            }
-            let completed = fence.GetCompletedValue();
-            if completed == u64::MAX {
-                return Err("device removed: fence completion is u64::MAX".into());
-            }
-            if completed >= value {
-                if let Err(e) = device.GetDeviceRemovedReason() {
-                    return Err(format!("device removed: {}", err(e)));
-                }
-                return Ok(());
-            }
-            std::thread::yield_now();
+    // SAFETY: the queue and fence belong to this device and outlive the submission.
+    unsafe { queue.Signal(fence, value) }.map_err(err)?;
+    wait_for_fence(device, fence, value)
+}
+
+/// Waits for `fence` to signal, or fails with a named error.
+///
+/// A device that neither signals the fence nor reports itself removed used to wedge the
+/// test binary forever. The deadline turns that into a failing test that says what
+/// happened; `VICTORY_WAIT_SECS` overrides the default for a deliberately long run.
+fn wait_for_fence(dev: &ID3D12Device, fence: &ID3D12Fence, value: u64) -> Result<(), String> {
+    let secs: u64 = std::env::var("VICTORY_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    let started = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(secs);
+    // SAFETY: this reads the status of the live device.
+    let check_device = || unsafe { dev.GetDeviceRemovedReason() }
+        .map_err(|e| format!("device removed: {}", err(e)));
+    check_device()?;
+    loop {
+        // SAFETY: the caller holds the fence for this wait.
+        let completed = unsafe { fence.GetCompletedValue() };
+        check_device()?;
+        // D3D12 also reports a removed device by setting the fence to UINT64_MAX.
+        if completed == u64::MAX {
+            return Err("device removed: fence completion is u64::MAX".into());
         }
+        if completed >= value {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "the GPU did not complete the work within {secs} s: no fence signal and the device is not removed (raise VICTORY_WAIT_SECS for a deliberately long run)"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 
@@ -2101,6 +2120,24 @@ mod tests {
     use std::sync::Barrier;
 
     use super::*;
+
+    #[test]
+    fn fence_wait_rejects_the_removed_value() {
+        let Ok(host) = Host::new(false).or_else(|_| Host::new(true)) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        let dev = &host.device;
+        // SAFETY: both fences are local to this test and have no submitted work.
+        let make_fence = |value| unsafe {
+            dev.CreateFence::<ID3D12Fence>(value, D3D12_FENCE_FLAG_NONE)
+                .expect("test fence")
+        };
+        wait_for_fence(dev, &make_fence(1), 1).expect("completed fence");
+        let error = wait_for_fence(dev, &make_fence(u64::MAX), 1)
+            .expect_err("the removal sentinel must stop readback");
+        assert!(error.contains("device removed"), "{error}");
+    }
 
     /// Regression test for concurrent WARP device creation, pipeline
     /// compilation, and draws across threads (issue #181).
