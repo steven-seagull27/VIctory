@@ -168,18 +168,24 @@ fn wait_for_fence(dev: &ID3D12Device, fence: &ID3D12Fence) -> Result<(), String>
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(120);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let started = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(secs);
     loop {
         // SAFETY: both calls only read device state through interfaces owned by the
         // caller for the duration of this call.
-        if unsafe { fence.GetCompletedValue() } >= 1 {
-            return Ok(());
-        }
+        let completed = unsafe { fence.GetCompletedValue() };
         // SAFETY: as above.
         if let Err(e) = unsafe { dev.GetDeviceRemovedReason() } {
             return Err(format!("device removed: {}", err(e)));
         }
-        if std::time::Instant::now() >= deadline {
+        // D3D12 also reports a removed device by setting the fence to UINT64_MAX.
+        if completed == u64::MAX {
+            return Err("device removed: fence completion is u64::MAX".into());
+        }
+        if completed >= 1 {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
             return Err(format!(
                 "the GPU did not complete the work within {secs} s: no fence signal and the device is not removed (raise VICTORY_WAIT_SECS for a deliberately long run)"
             ));
@@ -2039,6 +2045,24 @@ mod tests {
     use std::sync::Barrier;
 
     use super::*;
+
+    #[test]
+    fn fence_wait_rejects_the_removed_value() {
+        let Ok(host) = Host::new(false).or_else(|_| Host::new(true)) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        let dev = &host.device;
+        // SAFETY: both fences are local to this test and have no submitted work.
+        let make_fence = |value| unsafe {
+            dev.CreateFence::<ID3D12Fence>(value, D3D12_FENCE_FLAG_NONE)
+                .expect("test fence")
+        };
+        wait_for_fence(dev, &make_fence(1)).expect("completed fence");
+        let error = wait_for_fence(dev, &make_fence(u64::MAX))
+            .expect_err("the removal sentinel must stop readback");
+        assert!(error.contains("device removed"), "{error}");
+    }
 
     /// Regression test for concurrent WARP device creation, pipeline
     /// compilation, and draws across threads (issue #181).
