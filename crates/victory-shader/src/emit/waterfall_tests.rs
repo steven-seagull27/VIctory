@@ -247,6 +247,16 @@ fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
 }
 
 #[test]
+fn lanes_still_sample_their_own_table_offset_when_setup_follows_the_loop_in_code_order() {
+    let words = crate::resource::tests::waterfall_with_setup_after_loop();
+    let shader = build(&words, false);
+    for (label, red) in sampled(&shader) {
+        let want: Vec<f32> = (0..32).map(|lane| [1.0, 2.0][lane & 1]).collect();
+        assert_eq!(red, want, "{label}");
+    }
+}
+
+#[test]
 fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
     use crate::resource::tests::cmpx_waterfall;
     // Lanes below 16 hold the first descriptor, the others the second.

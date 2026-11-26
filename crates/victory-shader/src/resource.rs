@@ -3280,6 +3280,34 @@ pub(crate) mod tests {
         0xBF81_0000, // s_endpgm
     ];
 
+    // The setup runs before the loop but has a higher block number. Its
+    // static loads and the loop's dynamic load reach the table in that order.
+    pub(crate) fn waterfall_with_setup_after_loop() -> Vec<u32> {
+        let (setup, body) = WATERFALL_INDEXED_WAVE32.split_at(16);
+        let mut words = vec![0xBF82_0000 | body.len() as u32]; // branch to setup
+        words.extend_from_slice(body);
+        words.extend_from_slice(setup);
+        let back = -(words.len() as i32);
+        words.push(0xBF82_0000 | u32::from(back as i16 as u16)); // branch to body
+        words
+    }
+
+    #[test]
+    fn a_waterfall_after_a_higher_numbered_setup_keeps_its_per_lane_table_load() {
+        let resources = waterfall(&waterfall_with_setup_after_loop(), false).unwrap();
+        let image = resources
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Loaded { load, first: 0 } = image.source else {
+            panic!("unexpected image descriptor {:?}", image.source)
+        };
+        assert_eq!(resources.waterfall.loads, [load]);
+        assert_eq!(resources.waterfall.reads.len(), 1);
+        assert_eq!(resources.waterfall.compares.len(), 1);
+    }
+
     #[test]
     fn the_console_waterfall_over_a_first_lane_offset_is_one() {
         let r = waterfall(WATERFALL_INDEXED_WAVE32, false).unwrap();
