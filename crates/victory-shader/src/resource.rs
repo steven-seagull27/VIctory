@@ -163,7 +163,7 @@ pub fn track(
     stage: HwStage,
     lanes: Option<&Structured>,
 ) -> Result<Resources, ShaderError> {
-    let t = Tracer::new(p, layout, stage, lanes)?;
+    let (t, order) = Tracer::with_block_order(p, layout, stage, lanes)?;
     let mut out = Resources {
         params: p
             .inputs
@@ -186,7 +186,9 @@ pub fn track(
     // Visit producers before consumers. Index order misses loads that land in
     // higher-indexed blocks (for example after `split_irreducible` appends a
     // copy) when a lower-indexed consumer runs first (VIC-BT-024 / #1249).
-    for b in crate::ir::reverse_postorder(&p.blocks) {
+    // Scalar addresses are appended in traversal order.
+    let site_key = |(block, inst): Site| (t.rpo[block], inst);
+    for b in order {
         let block = &p.blocks[b];
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -200,7 +202,9 @@ pub fn track(
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 if let Source::Loaded { load, .. } = source
-                    && let Ok(idx) = out.scalar.binary_search_by_key(&load, |s| s.0)
+                    && let Ok(idx) = out
+                        .scalar
+                        .binary_search_by_key(&site_key(load), |s| site_key(s.0))
                     && let Some(Term::Value(v)) = out.scalar[idx].1.dynamic.map(|d| t.origin(d))
                     && t.first_lane_source(v).is_some()
                 {
@@ -406,12 +410,12 @@ const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
 
 impl<'a> Tracer<'a> {
-    fn new(
+    fn with_block_order(
         p: &'a Program,
         layout: &'a [RootParam],
         stage: HwStage,
         lanes: Option<&'a Structured>,
-    ) -> Result<Self, ShaderError> {
+    ) -> Result<(Self, Vec<usize>), ShaderError> {
         let all = || {
             p.inputs
                 .iter()
@@ -474,7 +478,7 @@ impl<'a> Tracer<'a> {
             // Sums traced to find them are older than these origins.
             t.sums.take();
         }
-        Ok(t)
+        Ok((t, order))
     }
 
     #[inline]
@@ -2636,7 +2640,7 @@ pub(crate) mod tests {
         .collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
         let layout = [param(Table, 4, 1)];
-        let t = Tracer::new(&p, &layout, HwStage::Cs, None).unwrap();
+        let (t, _) = Tracer::with_block_order(&p, &layout, HwStage::Cs, None).unwrap();
         let block = &p.blocks[0];
         let value = |n: usize, k: usize| t.origin(block.insts[n].writes[k].1);
         assert_eq!(value(1, 0), Term::Const(0x00FF_F000));
@@ -4138,7 +4142,7 @@ pub(crate) mod tests {
             0xBE87_0306, // join: s_mov_b32 s7, s6
             S_ENDPGM,
         ]);
-        let t_acyc = Tracer::new(&acyclic, &layout, HwStage::Cs, None).unwrap();
+        let (t_acyc, _) = Tracer::with_block_order(&acyclic, &layout, HwStage::Cs, None).unwrap();
         assert_eq!(t_acyc.origin, reference_origins(&t_acyc));
 
         // 2) Cyclic loop carrying an invariant move and a changing register.
@@ -4152,7 +4156,7 @@ pub(crate) mod tests {
             0xBE87_0306, // s_mov_b32 s7, s6
             S_ENDPGM,
         ]);
-        let t_cyc = Tracer::new(&cyclic, &layout, HwStage::Cs, None).unwrap();
+        let (t_cyc, _) = Tracer::with_block_order(&cyclic, &layout, HwStage::Cs, None).unwrap();
         assert_eq!(t_cyc.origin, reference_origins(&t_cyc));
 
         // 3) Waterfall multi-block cyclic CFG.
@@ -4162,7 +4166,8 @@ pub(crate) mod tests {
             .collect();
         let wf_p = crate::ir::build(&wf_code, false, 256).unwrap();
         let wf_st = crate::structure::structure(&wf_p).unwrap();
-        let t_wf = Tracer::new(&wf_p, &layout, HwStage::Ps, Some(&wf_st)).unwrap();
+        let (t_wf, _) =
+            Tracer::with_block_order(&wf_p, &layout, HwStage::Ps, Some(&wf_st)).unwrap();
         assert_eq!(t_wf.origin, reference_origins(&t_wf));
     }
 
