@@ -126,6 +126,10 @@ fn create_title_rt(format: DXGI_FORMAT, flags: u32) -> This {
 }
 
 fn read_back_u32(host: &crate::host::Host, title_rt: This, format: DXGI_FORMAT) -> u32 {
+    read_back_4x4(host, title_rt, format)[0]
+}
+
+fn read_back_4x4(host: &crate::host::Host, title_rt: This, format: DXGI_FORMAT) -> [u32; 16] {
     let tex = crate::resource::host_resource(title_rt).expect("host texture");
     // SAFETY: a live resource.
     let mut desc = unsafe { tex.GetDesc() };
@@ -169,8 +173,14 @@ fn read_back_u32(host: &crate::host::Host, title_rt: This, format: DXGI_FORMAT) 
     }
     list.close();
     host.execute(&[&list]);
-    // SAFETY: copy finished; offset 0 holds the first 32-bit texel.
-    unsafe { mapped.add(footprint.Offset as usize).cast::<u32>().read() }
+    assert_eq!((desc.Width, desc.Height), (4, 4));
+    std::array::from_fn(|i| {
+        let at = footprint.Offset as usize
+            + (i / 4) * footprint.Footprint.RowPitch as usize
+            + 4 * (i % 4);
+        // SAFETY: the copy is complete and this 32-bit texel is inside the mapped footprint.
+        unsafe { mapped.add(at).cast::<u32>().read_unaligned() }
+    })
 }
 
 fn drain_d3d12_errors(device: &ID3D12Device) -> Vec<(i32, String)> {
@@ -292,6 +302,29 @@ fn create_graphics_stream_pso(
 /// expected pixels to both targets.
 #[test]
 fn mismatched_rtv_format_builds_variant_and_draws_cleanly() {
+    check_rtv_variant(VariantStart::Prebuilt);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VariantStart {
+    Prebuilt,
+    FirstDraw,
+    SpentBudget,
+}
+
+#[test]
+#[ignore = "first-use timing: run alone in a fresh process"]
+fn unbuilt_rtv_variant_first_draw() {
+    check_rtv_variant(VariantStart::FirstDraw);
+}
+
+#[test]
+#[ignore = "intentionally spends the frame's shared wait budget; run alone"]
+fn unbuilt_rtv_variant_with_spent_frame_budget() {
+    check_rtv_variant(VariantStart::SpentBudget);
+}
+
+fn check_rtv_variant(start: VariantStart) {
     let Some(host) = crate::host::host() else {
         return;
     };
@@ -307,18 +340,19 @@ fn mismatched_rtv_format_builds_variant_and_draws_cleanly() {
     let ps = synthetic_shader("pixel", victory_shader::HwStage::Ps, &ps_bytes);
     let pso = create_graphics_stream_pso(&vs, &ps, &[DXGI_FORMAT_R10G10B10A2_UNORM]);
 
-    // Warm base and R11G11B10_FLOAT variant; verify distinct PSOs and cache hit.
+    // Keep a ready matching pipeline as a control in every run.
     let base = wait_pipeline(pso, &[DXGI_FORMAT_R10G10B10A2_UNORM]);
-    let variant = wait_pipeline(pso, &[DXGI_FORMAT_R11G11B10_FLOAT]);
-    assert_ne!(
-        base.pso.as_raw(),
-        variant.pso.as_raw(),
-        "format variant must be a separate host PSO"
-    );
-    let cached = wait_pipeline(pso, &[DXGI_FORMAT_R11G11B10_FLOAT]);
-    assert!(Arc::ptr_eq(&variant, &cached));
+    assert!(pipeline(pso).variants.lock().unwrap().is_empty());
+    if start == VariantStart::Prebuilt {
+        wait_pipeline(pso, &[DXGI_FORMAT_R11G11B10_FLOAT]);
+    } else if start == VariantStart::SpentBudget {
+        let pending = &pipeline(pso).host;
+        let unqueued = pending.variant(pending.graphics.as_deref().unwrap().targets);
+        make::spend_remaining_frame_budget_for_test(&unqueued);
+    }
 
     let rt_r11 = create_title_rt(DXGI_FORMAT_R11G11B10_FLOAT, 1);
+    let rt_retry = create_title_rt(DXGI_FORMAT_R11G11B10_FLOAT, 1);
     let rt_r10 = create_title_rt(DXGI_FORMAT_R10G10B10A2_UNORM, 1);
 
     let null = std::ptr::null();
@@ -337,8 +371,10 @@ fn mismatched_rtv_format_builds_variant_and_draws_cleanly() {
     let rtv_start = crate::descriptor::heap(rtv_heap).start;
     let rtv_r11 = rtv_start;
     let rtv_r10 = rtv_start + 128;
+    let rtv_retry = rtv_start + 256;
     crate::descriptor::create_rtv(null, rt_r11, std::ptr::null(), rtv_r11);
     crate::descriptor::create_rtv(null, rt_r10, std::ptr::null(), rtv_r10);
+    crate::descriptor::create_rtv(null, rt_retry, std::ptr::null(), rtv_retry);
 
     let mut allocator = null;
     let mut list = null;
@@ -391,8 +427,34 @@ fn mismatched_rtv_format_builds_variant_and_draws_cleanly() {
             ..Default::default()
         },
     );
-    set_targets(list, 1, &rtv_r11, 0, std::ptr::null());
+    let clear =
+        slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const RECT)>(list, 0x1a0);
+    // Prime the regular draw machinery with the matching base PSO. Clear
+    // this target again so the final switch back must really draw to pass.
+    set_targets(list, 1, &rtv_r10, 0, std::ptr::null());
     draw(list, 3, 1, 0, 0);
+    clear(list, rtv_r10, &[0.0; 4], 0, std::ptr::null());
+    clear(list, rtv_r11, &[0.0; 4], 0, std::ptr::null());
+    clear(list, rtv_retry, &[0.0; 4], 0, std::ptr::null());
+    set_targets(list, 1, &rtv_r11, 0, std::ptr::null());
+    if start != VariantStart::Prebuilt {
+        assert!(pipeline(pso).variants.lock().unwrap().is_empty());
+    }
+    let began = std::time::Instant::now();
+    draw(list, 3, 1, 0, 0);
+    let first_us = began.elapsed().as_micros();
+    // Wait only after the first real draw. A second target makes the retry
+    // independent of the first target's contents.
+    let variant = wait_pipeline(pso, &[DXGI_FORMAT_R11G11B10_FLOAT]);
+    assert_ne!(base.pso.as_raw(), variant.pso.as_raw());
+    assert!(Arc::ptr_eq(
+        &variant,
+        &wait_pipeline(pso, &[DXGI_FORMAT_R11G11B10_FLOAT])
+    ));
+    set_targets(list, 1, &rtv_retry, 0, std::ptr::null());
+    let began = std::time::Instant::now();
+    draw(list, 3, 1, 0, 0);
+    let cached_us = began.elapsed().as_micros();
     set_targets(list, 1, &rtv_r10, 0, std::ptr::null());
     draw(list, 3, 1, 0, 0);
     assert_eq!(close(list), S_OK);
@@ -408,13 +470,21 @@ fn mismatched_rtv_format_builds_variant_and_draws_cleanly() {
         "unexpected D3D12 Error 613: {errors:?}"
     );
 
-    let rgb11 = decode_r11g11b10_float(read_back_u32(host, rt_r11, DXGI_FORMAT_R11G11B10_FLOAT));
-    assert!(
-        (rgb11[0] - 0.5).abs() < 0.02
-            && (rgb11[1] - 0.25).abs() < 0.02
-            && (rgb11[2] - 0.75).abs() < 0.02,
-        "R11G11B10_FLOAT readback mismatch: {rgb11:?}"
+    let first = read_back_4x4(host, rt_r11, DXGI_FORMAT_R11G11B10_FLOAT);
+    let cached = read_back_4x4(host, rt_retry, DXGI_FORMAT_R11G11B10_FLOAT);
+    let count = |words: &[u32]| {
+        words
+            .iter()
+            .filter(|&&w| decode_r11g11b10_float(w) == [0.5, 0.25, 0.75])
+            .count()
+    };
+    let (fresh, reused) = (count(&first), count(&cached));
+    let black = first.iter().filter(|&&w| w == 0).count();
+    eprintln!(
+        "RTV {start:?}: first={fresh}/16 cached={reused}/16 black={black}/16 first_us={first_us} cached_us={cached_us}"
     );
+    assert_eq!(reused, 16);
+    assert!(fresh == 16 || (black == 16 && start != VariantStart::Prebuilt));
     let rgba10 =
         decode_r10g10b10a2_unorm(read_back_u32(host, rt_r10, DXGI_FORMAT_R10G10B10A2_UNORM));
     assert!(
@@ -425,7 +495,7 @@ fn mismatched_rtv_format_builds_variant_and_draws_cleanly() {
         "R10G10B10A2_UNORM readback mismatch: {rgba10:?}"
     );
 
-    for obj in [list, allocator, rtv_heap, rt_r11, rt_r10, pso] {
+    for obj in [list, allocator, rtv_heap, rt_r11, rt_retry, rt_r10, pso] {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(obj, 0x10)(obj), 0);
     }
 }

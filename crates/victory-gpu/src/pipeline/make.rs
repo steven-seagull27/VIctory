@@ -275,6 +275,13 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
+#[cfg(test)]
+pub(super) fn spend_remaining_frame_budget_for_test(p: &Pending) {
+    // An unqueued test pipeline stays pending for the normal wait timeout.
+    assert!(!p.queued.load(Ordering::Relaxed) && p.made.get().is_none());
+    wait(p, crate::frame::current());
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
