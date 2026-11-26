@@ -16,8 +16,8 @@
 //! of the key, so changing the encoding invalidates every entry.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
@@ -82,7 +82,10 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    // Writes through views mark their pages: copy-backs compare only those
+    // (`crate::shadow::copy_back_marks`).
+    let options = victory_shader::emit::Options { view_marks: true };
+    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => (translate(container), false),
@@ -90,10 +93,14 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
 }
 
 /// The cache entry's converter: the build and the container in, the
-/// encoded translation (or refusal) out. `ran` tells a miss from a hit.
+/// encoded translation (or refusal) out. `ran` tells a miss from a hit;
+/// `made` keeps a miss's translation, so the entry just written is not read
+/// back (the first read of a new file costs about as much as a small
+/// translation where a virus scanner looks at it: 0.5-3 ms here).
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
+    made: Mutex<Option<Result<HostShader, String>>>,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -106,7 +113,10 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        Ok(encode(&(self.translate)(&input[32..])))
+        let made = (self.translate)(&input[32..]);
+        let bytes = encode(&made);
+        *self.made.lock().unwrap_or_else(|e| e.into_inner()) = Some(made);
+        Ok(bytes)
     }
 }
 
@@ -120,6 +130,14 @@ fn cached(
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
+        made: Mutex::new(None),
+    };
+    let made = || {
+        converter
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     };
     for _ in 0..2 {
         let path = match cache.get_or_convert(&converter, &input) {
@@ -129,6 +147,11 @@ fn cached(
                 break;
             }
         };
+        if let Some(shader) = made() {
+            MISSES.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(path = %path.display(), "shader translated and cached");
+            return (shader, false);
+        }
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let hit = !converter.ran.load(Ordering::Relaxed);
             let (counter, what) = if hit {
@@ -144,7 +167,11 @@ fn cached(
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    ((converter.translate)(container), false)
+    // A translation whose entry could not be written is not made again.
+    (
+        made().unwrap_or_else(|| (converter.translate)(container)),
+        false,
+    )
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";
@@ -208,6 +235,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         view_addresses,
         heap,
         heap_writes,
+        view_marks,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -256,7 +284,8 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*memory_writes) << 1
             | u32::from(*view_addresses) << 2
             | u32::from(*heap) << 3
-            | u32::from(*heap_writes) << 4,
+            | u32::from(*heap_writes) << 4
+            | u32::from(*view_marks) << 5,
     );
     out
 }
@@ -333,6 +362,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         view_addresses: memory & 4 != 0,
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
+        view_marks: memory & 32 != 0,
     }))
 }
 
@@ -365,6 +395,7 @@ mod tests {
             view_addresses: true,
             heap: true,
             heap_writes: true,
+            view_marks: true,
         }
     }
 
@@ -421,6 +452,27 @@ mod tests {
         assert_eq!(cached(&cache, &build, b"other", fail), refused);
         assert_eq!(cached(&cache, &build, b"other", fail), (refused.0, true));
         assert_eq!(fails.load(Ordering::Relaxed), 1);
+    }
+
+    /// A translation whose entry cannot be written (the cache folder is
+    /// a file now) is handed back as it was made, not made again.
+    #[test]
+    fn a_translation_is_made_once_when_its_entry_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cache");
+        let cache = Cache::open(&root).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::write(&root, b"not a folder").unwrap();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        assert_eq!(
+            cached(&cache, &[7; 32], b"a container", translate),
+            (Ok(shader()), false)
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
     }
 
     /// The key's parts: a change to any of them (the translator's sources,
