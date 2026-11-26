@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{self, EXEC, Inst, M0, Program, Reg, Value};
+use crate::native::{HwStage, NativeProgram};
 use crate::structure::{self, Atom, LaneExit, Structured};
 
 /// [`ir::build`] and [`structure::structure`], built again with the register
@@ -38,8 +39,26 @@ pub fn build(
     wave64: bool,
     vgprs: u16,
 ) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
+    build_in_stage(code, wave64, vgprs, None)
+}
+
+/// Build the code and branch conditions used by this shader stage, including
+/// the same VCC decision used when lowering graphics programs to DXIL.
+pub fn build_native(
+    native: &NativeProgram,
+) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
+    build_in_stage(&native.patched_code(), native.wave64, native.vgprs, Some(native.stage))
+}
+
+fn build_in_stage(
+    code: &[u8],
+    wave64: bool,
+    vgprs: u16,
+    stage: Option<HwStage>,
+) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
+    let structure = |p: &Program| structure::structure_as(p, true, stage);
     let p = ir::build(code, wave64, vgprs)?;
-    let st = structure::structure(&p);
+    let st = structure(&p);
     let mut assumed: HashMap<usize, u8> = p
         .blocks
         .iter()
@@ -56,7 +75,7 @@ pub fn build(
             break;
         }
         let q = ir::build_bounded(code, wave64, vgprs, &assumed)?;
-        let Ok(s) = structure::structure(&q) else {
+        let Ok(s) = structure(&q) else {
             break;
         };
         let found = relative_bounds(&q, &s);
@@ -69,7 +88,7 @@ pub fn build(
                 return Ok((q, Ok(s)));
             }
             let q = ir::build_bounded(code, wave64, vgprs, &proven)?;
-            let s = structure::structure(&q);
+            let s = structure(&q);
             return Ok((q, s));
         }
         assumed = assumed

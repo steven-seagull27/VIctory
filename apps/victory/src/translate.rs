@@ -508,7 +508,7 @@ fn translate(
     };
     for p in programs {
         t.programs += 1;
-        match victory_shader::range::build(&p.patched_code(), p.wave64, p.vgprs) {
+        match victory_shader::range::build_native(&p) {
             Ok((program, structured)) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();

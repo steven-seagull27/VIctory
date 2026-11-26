@@ -32,6 +32,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
+use crate::native::HwStage;
 use crate::resource::lane_of;
 
 /// A per-lane boolean: a node of [`Bools`]. Equal functions are equal nodes.
@@ -490,7 +491,7 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, true)
+    structure_as(program, true, None)
 }
 
 /// The per-lane form with a pixel's discarded lanes taken out of the live
@@ -498,11 +499,15 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// what a program needs whose discarded lanes would read values no
 /// surviving lane does (see [`Structured::discards`]).
 pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, false)
+    structure_as(program, false, Some(HwStage::Ps))
 }
 
-fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
-    let mut l = Lanes::new(program)?;
+pub(crate) fn structure_as(
+    program: &Program,
+    helpers: bool,
+    stage: Option<HwStage>,
+) -> Result<Structured, ShaderError> {
+    let mut l = Lanes::new(program, stage)?;
     if !helpers {
         l.kills.clear();
     }
@@ -524,6 +529,9 @@ type Key = (Value, Value);
 
 struct Lanes<'a> {
     p: &'a Program,
+    /// Graphics stages use their existing per-lane fallback for VCC derived
+    /// from a lane mask. Keep that mask available to range and path analysis.
+    per_lane_vcc: bool,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -580,7 +588,7 @@ struct SopMasks {
 const MAX_ROUNDS: usize = 256;
 
 impl<'a> Lanes<'a> {
-    fn new(p: &'a Program) -> Result<Self, ShaderError> {
+    fn new(p: &'a Program, stage: Option<HwStage>) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
         let order = crate::ir::reverse_postorder(blocks);
         let mut index = vec![usize::MAX; blocks.len()];
@@ -605,6 +613,7 @@ impl<'a> Lanes<'a> {
         }
         let mut l = Lanes {
             p,
+            per_lane_vcc: matches!(stage, Some(HwStage::Ps | HwStage::Vs | HwStage::Ms)),
             order,
             index,
             incoming,
@@ -1336,12 +1345,13 @@ impl<'a> Lanes<'a> {
             n @ ("s_cbranch_vccz" | "s_cbranch_vccnz") => {
                 let any = match self.key(|r| inst.read(r), VCC) {
                     Some(k) => {
-                        let (mask, _) = self.mask(k);
+                        let (mask, derived) = self.mask(k);
                         // Only fold a known register value. Facts about the
                         // bits of lanes reaching a join do not describe the whole register.
                         match self.immediate_mask(k) {
                             Some(false) => Bool::FALSE,
                             Some(true) => Bool::TRUE,
+                            None if self.per_lane_vcc && derived => mask,
                             None if self.uniform_entry_subset(k, mask) => mask,
                             _ => {
                                 let born = self.born(k.0).max(self.born(k.1));
