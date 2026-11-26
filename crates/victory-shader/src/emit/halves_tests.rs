@@ -491,14 +491,24 @@ fn dpp_row_masks_name_the_console_rows_on_every_gpu() {
 /// `v_readfirstlane_b32` of the thread id, with console lanes (`v_mbcnt`):
 /// the console's first lane is lane 0 of the wave.
 fn first_lane_of_the_thread_id() -> Vec<u32> {
+    first_lane_with_mask(None)
+}
+
+fn first_lane_with_mask(compare: Option<u32>) -> Vec<u32> {
     let mut w = PROLOGUE.to_vec();
     w.extend([
         0x3420_0085, // v_lshlrev_b32 v16, 5, v0
         0xD765_0001,
         0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
-        0x7E18_0500, // v_readfirstlane_b32 s12, v0
-        0x7E04_020C, // v_mov_b32 v2, s12
     ]);
+    if let Some(compare) = compare {
+        w.extend([compare, 0xBE94_246A]); // s_and_saveexec_b64 s[20:21], vcc
+    }
+    w.push(0x7E18_0500); // v_readfirstlane_b32 s12, v0
+    if compare.is_some() {
+        w.push(0x88FE_147E); // s_or_b64 exec, exec, s[20:21]
+    }
+    w.push(0x7E04_020C); // v_mov_b32 v2, s12
     w.extend(store(2, 0));
     w.push(S_ENDPGM);
     w
@@ -558,6 +568,21 @@ fn first_lanes_kept_in_halves_match_the_console_on_every_gpu() {
     let mut failed = differences(&first_lane_of_the_thread_id(), 32, 1, &[0; 32]);
     let want: Vec<u32> = (0..128).flat_map(|l| [l >> 6, l & 63]).collect();
     failed.extend(differences(&first_lane_alike(), 128, 2, &want));
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+#[test]
+fn first_lane_of_a_small_group_respects_guest_exec() {
+    let mut failed = Vec::new();
+    for (compare, first) in [
+        (0x7d88_00a0, 0),  // 32 > tid
+        (0x7d82_0086, 7),  // 6 < tid
+        (0x7d82_009e, 31), // 30 < tid
+        (0x7d88_0080, 0),  // 0 > tid: empty EXEC reads lane zero
+    ] {
+        let w = first_lane_with_mask(Some(compare));
+        failed.extend(differences(&w, 32, 1, &[first; 32]));
+    }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
