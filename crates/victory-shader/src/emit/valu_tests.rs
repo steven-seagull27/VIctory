@@ -2249,7 +2249,13 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
     );
 }
 
-fn build_wave_prefix_cs(vop2_op: u8, ident: u32, inclusive: bool, wave64: bool) -> HostShader {
+fn build_wave_prefix_cs(
+    vop2_op: u8,
+    ident: u32,
+    inclusive: bool,
+    wave64: bool,
+    threads: u32,
+) -> HostShader {
     let sop1 = |sdst: u8, op: u8, src0: u8| -> u32 {
         0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | src0 as u32
     };
@@ -2276,7 +2282,7 @@ fn build_wave_prefix_cs(vop2_op: u8, ident: u32, inclusive: bool, wave64: bool) 
     w.push(vop2_rr(0x1D, 3, vgpr(4), 3));
     w.push(vop2_rr(0x25, 3, sgpr(1), 3));
 
-    // Pre-fill uav[v0] = 0xDEAD_BEEF across all 32 lanes.
+    // Pre-fill uav[v0] = 0xDEAD_BEEF for each thread in the group.
     w.push(vop1(0x001, 5, 255));
     w.push(0xDEAD_BEEF);
     w.push(vop2_rr(0x1A, 6, 130, 0));
@@ -2396,7 +2402,7 @@ fn build_wave_prefix_cs(vop2_op: u8, ident: u32, inclusive: bool, wave64: bool) 
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: (5 << 1) | (1 << 11),
-            threads: std::array::from_fn(|i| if i == 0 { 32 } else { 1 }),
+            threads: [threads, 1, 1],
         }),
         code,
     };
@@ -2507,105 +2513,148 @@ fn wave_prefix_non_sum_ops_match_scan_across_lanes() {
     ];
 
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut checked = 0u32;
-    // Per variant (wave64, wave32) and host (hardware, warp): lane comparisons
-    // run, PSOs built and PSOs refused.
-    let mut ran = [[0u32; 2]; 2];
-    let mut built = [[0u32; 2]; 2];
-    let mut refused = [[0u32; 2]; 2];
+    // Retain the original half-populated wave64 alongside the two full waves.
+    const VARIANTS: [(bool, u32); 3] = [(true, 32), (false, 32), (true, 64)];
+    #[derive(Clone, Copy, Default)]
+    struct Counts {
+        built: u32,
+        refused: u32,
+        comparisons: u32,
+        mismatches: u32,
+    }
+    let mut counts = [[Counts::default(); 2]; VARIANTS.len()];
+    let warp_only = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    let adapters: Vec<_> = [("hardware", false), ("warp", true)]
+        .into_iter()
+        .filter(|&(_, warp)| warp || !warp_only)
+        .map(|(label, warp)| {
+            let result = Host::new(warp).map(|host| {
+                use windows::Win32::Graphics::Direct3D12::{
+                    D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+                };
+                let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+                // SAFETY: this live device writes an OPTIONS1 structure of the specified size.
+                unsafe {
+                    host.device.CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut caps).cast(),
+                        size_of_val(&caps) as u32,
+                    )
+                }
+                .expect("query wave capabilities");
+                (host, caps)
+            });
+            (label, result)
+        })
+        .collect();
     let seeds = [
         [0x1234_5678, 0x8000_0001, 0, 0],
         [0xFFFF_FFFF, 0x7F7F_FFFF, 0, 0],
     ];
 
-    for (name, vop2_op, ident, combine) in ops {
-        for (wave64, inclusive) in [(true, true), (true, false), (false, true), (false, false)] {
-            let variant = if wave64 { "wave64" } else { "wave32" };
-            let vi = usize::from(!wave64);
-            let shader = build_wave_prefix_cs(vop2_op, ident, inclusive, wave64);
-            for (hi, (label, warp)) in [("hardware", false), ("warp", true)]
-                .into_iter()
-                .enumerate()
-            {
-                let host = match Host::new(warp) {
-                    Ok(host) => host,
-                    Err(e) => {
-                        eprintln!("no SM 6.6 {label} device ({e}); skipped");
-                        continue;
-                    }
-                };
-                let (root, pso) = match host.compute_pipeline(&shader) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("{label} {variant} ({name}, inc={inclusive}): PSO skipped ({e})");
-                        refused[vi][hi] += 1;
-                        continue;
-                    }
-                };
-                built[vi][hi] += 1;
-                for inputs in seeds {
-                    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-                    for u in &shader.user_data {
-                        ud[u.index as usize] = match (u.root, u.slot) {
-                            (RootType::Constants, 0) => inputs[u.dword as usize],
-                            (RootType::Table, 1) => 0,
-                            other => panic!("unexpected user data {other:?}"),
-                        };
-                    }
-                    let out = host
-                        .dispatch(
-                            &root,
-                            &pso,
-                            &Dispatch {
-                                roots: vec![(0, Root::Constants(ud))],
-                                views: &[View::RawUav(32)],
-                                samplers: &[],
-                                groups: std::array::from_fn(|_| 1),
-                            },
-                        )
-                        .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+    for (vi, (wave64, threads)) in VARIANTS.into_iter().enumerate() {
+        let wave = if wave64 { 64 } else { 32 };
+        for (name, vop2_op, ident, combine) in ops {
+            for inclusive in [true, false] {
+                let shader = build_wave_prefix_cs(vop2_op, ident, inclusive, wave64, threads);
+                for (hi, (label, result)) in adapters.iter().enumerate() {
+                    let Ok((host, _)) = result else { continue };
+                    let count = &mut counts[vi][hi];
+                    let (root, pso) = match host.compute_pipeline(&shader) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!(
+                                "{label} Wave{wave}/{threads} threads ({name}, inc={inclusive}): PSO skipped ({e})"
+                            );
+                            count.refused += 1;
+                            continue;
+                        }
+                    };
+                    count.built += 1;
+                    for inputs in seeds {
+                        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                        for u in &shader.user_data {
+                            ud[u.index as usize] = match (u.root, u.slot) {
+                                (RootType::Constants, 0) => inputs[u.dword as usize],
+                                (RootType::Table, 1) => 0,
+                                other => panic!("unexpected user data {other:?}"),
+                            };
+                        }
+                        let out = host
+                            .dispatch(
+                                &root,
+                                &pso,
+                                &Dispatch {
+                                    roots: vec![(0, Root::Constants(ud))],
+                                    views: &[View::RawUav(threads)],
+                                    samplers: &[],
+                                    groups: std::array::from_fn(|_| 1),
+                                },
+                            )
+                            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
 
-                    let mut acc = ident;
-                    for lane in 0..32u32 {
-                        let active = (lane & 3) != 0;
-                        let s0 = inputs.first().copied().unwrap();
-                        let s1 = inputs.get(1).copied().unwrap();
-                        let val = ((lane ^ s0) ^ (lane << 17)).wrapping_add(s1);
-                        let term = if active { val } else { ident };
-                        let want = if inclusive {
-                            acc = combine(acc, term);
-                            if active { acc } else { 0xDEAD_BEEF }
-                        } else {
-                            let prev = acc;
-                            acc = combine(acc, term);
-                            if active { prev } else { 0xDEAD_BEEF }
-                        };
-                        let got = out.first().unwrap()[lane as usize];
-                        assert_eq!(
-                            got, want,
-                            "{label} {variant} ({name}, inclusive={inclusive}) lane {lane}: got {got:#010x}, want {want:#010x}"
-                        );
-                        checked += 1;
-                        ran[vi][hi] += 1;
+                        let mut acc = ident;
+                        for lane in 0..threads {
+                            let active = (lane & 3) != 0;
+                            let s0 = inputs.first().copied().unwrap();
+                            let s1 = inputs.get(1).copied().unwrap();
+                            let val = ((lane ^ s0) ^ (lane << 17)).wrapping_add(s1);
+                            let term = if active { val } else { ident };
+                            let want = if inclusive {
+                                acc = combine(acc, term);
+                                if active { acc } else { 0xDEAD_BEEF }
+                            } else {
+                                let prev = acc;
+                                acc = combine(acc, term);
+                                if active { prev } else { 0xDEAD_BEEF }
+                            };
+                            let got = out.first().unwrap()[lane as usize];
+                            if got != want {
+                                if count.mismatches == 0 {
+                                    eprintln!(
+                                        "{label} Wave{wave}/{threads} threads ({name}, inclusive={inclusive}) lane {lane}: got {got:#010x}, want {want:#010x}"
+                                    );
+                                }
+                                count.mismatches += 1;
+                            }
+                            count.comparisons += 1;
+                        }
                     }
                 }
             }
         }
     }
-    for (vi, variant) in ["wave64", "wave32"].into_iter().enumerate() {
-        for (hi, label) in ["hardware", "warp"].into_iter().enumerate() {
-            let (n, ok, no) = (ran[vi][hi], built[vi][hi], refused[vi][hi]);
-            let state = if ok > 0 {
-                "ran"
-            } else if no > 0 {
-                "skipped"
-            } else {
-                "no device"
+    let mut checked = 0;
+    let mut mismatches = 0;
+    let mut unexpected_refusals = 0;
+    for (vi, (wave64, threads)) in VARIANTS.into_iter().enumerate() {
+        let wave = if wave64 { 64 } else { 32 };
+        for (hi, (label, result)) in adapters.iter().enumerate() {
+            let count = counts[vi][hi];
+            let state = match result {
+                Err(error) => {
+                    eprintln!("no SM 6.6 {label} device ({error})");
+                    "no device"
+                }
+                Ok((_, caps)) => {
+                    let supports_wave = caps.WaveOps.as_bool()
+                        && (caps.WaveLaneCountMin..=caps.WaveLaneCountMax).contains(&wave);
+                    if supports_wave {
+                        unexpected_refusals += count.refused;
+                    }
+                    if count.built > 0 { "ran" } else { "skipped" }
+                }
             };
-            eprintln!(
-                "wave prefix {variant} on {label}: {state}, {n} lane comparisons \
-                 ({ok} PSOs built, {no} refused)"
+            assert_eq!(
+                count.comparisons,
+                count.built * seeds.len() as u32 * threads
             );
+            eprintln!(
+                "wave prefix Wave{wave}/{threads} threads on {label}: {state}, {}/{} lane mismatches ({} PSOs built, {} refused)",
+                count.mismatches, count.comparisons, count.built, count.refused
+            );
+            checked += count.comparisons;
+            mismatches += count.mismatches;
         }
     }
     eprintln!("wave prefix: {checked} lane comparisons ran in total");
@@ -2615,7 +2664,13 @@ fn wave_prefix_non_sum_ops_match_scan_across_lanes() {
             "VICTORY_REQUIRE_HW=1 but no wave prefix lane comparisons ran"
         );
     }
+    assert_eq!(
+        unexpected_refusals, 0,
+        "PSO refused on an adapter advertising the requested wave size"
+    );
+    assert_eq!(mismatches, 0, "wave prefix lane mismatches");
 }
+
 #[test]
 fn v_mul_legacy_f32_treats_denormals_as_zero() {
     // v_mul_legacy_f32 v0, v1, v2 (VOP2 opcode 0x007 in its VOP3 encoding)
