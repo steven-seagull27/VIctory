@@ -530,6 +530,9 @@ pub(crate) fn note_used(key: &str) {
 }
 
 #[cfg(test)]
+mod restart_test;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
