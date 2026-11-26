@@ -1184,8 +1184,12 @@ impl<'a> Lanes<'a> {
                         let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
                         let restored =
                             self.restored.contains_key(&k.0) && self.restored.contains_key(&k.1);
-                        takes_mask |= self.masks.contains_key(&k)
-                            || (phi && !self.joins_loaded(k) || restored) && self.mask(k).1;
+                        // A readlane restore also holds an ordinary scalar word.
+                        // A later lane-mask use resolves it through mask(); keep
+                        // scalar-only uses here numeric so their SCC is wave-wide.
+                        takes_mask |= !restored
+                            && (self.masks.contains_key(&k)
+                                || phi && !self.joins_loaded(k) && self.mask(k).1);
                     }
                 }
                 let touches_exec =

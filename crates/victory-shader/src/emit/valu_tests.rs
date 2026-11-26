@@ -2282,50 +2282,66 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
     });
 }
 
+fn run_restored_mask_cases(name: &str, shader: &HostShader, lanes: u32, cases: &[([u32; 4], u32)]) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        if !warp && std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+            continue;
+        }
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+        };
+        let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the live device writes one OPTIONS1 structure of this size.
+        unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut caps).cast(),
+                size_of_val(&caps) as u32,
+            )
+        }
+        .expect("query wave capabilities");
+        if !caps.WaveOps.as_bool() || !(caps.WaveLaneCountMin..=caps.WaveLaneCountMax).contains(&32)
+        {
+            eprintln!("{label}: {name}: Wave32 unavailable, skipped");
+            continue;
+        }
+        let (root, pso) = host.compute_pipeline(shader).expect("Wave32 pipeline");
+        for &(inputs, want) in cases {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(lanes)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {name}: dispatch failed: {e}"));
+            assert_eq!(
+                out[0],
+                vec![want; lanes as usize],
+                "{label}: {name}({inputs:?})"
+            );
+        }
+    }
+}
+
 #[test]
 fn spilled_lane_mask_restored_into_sop_and_select_matches_rdna2() {
-    let run_wave32 = |name: &str, shader: &HostShader, cases: &[([u32; 4], u32)]| {
-        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-        for (label, warp) in [("hardware", false), ("warp", true)] {
-            let Ok(host) = Host::new(warp) else {
-                continue;
-            };
-            let Ok((root, pso)) = host.compute_pipeline(shader) else {
-                // Inbox WARP rejects WaveSize(32) compute pipelines (`v_writelane_b32` /
-                // `waveActiveBallot` emit WaveSize(32)).
-                assert!(warp, "{label}: {name}: hardware adapter rejected Wave32 PSO");
-                continue;
-            };
-            for &(inputs, want) in cases {
-                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-                for u in &shader.user_data {
-                    ud[u.index as usize] = match (u.root, u.slot) {
-                        (RootType::Constants, 0) => inputs[u.dword as usize],
-                        (RootType::Table, 1) => 0,
-                        other => panic!("unexpected user data {other:?}"),
-                    };
-                }
-                let out = host
-                    .dispatch(
-                        &root,
-                        &pso,
-                        &Dispatch {
-                            roots: vec![(0, Root::Constants(ud))],
-                            views: &[View::RawUav(1)],
-                            samplers: &[],
-                            groups: [1, 1, 1],
-                        },
-                    )
-                    .unwrap_or_else(|e| panic!("{label}: {name}: dispatch failed: {e}"));
-                assert_eq!(
-                    out[0][0], want,
-                    "{label}: {name}({inputs:?}) = {:#010x}, want {want:#010x}",
-                    out[0][0]
-                );
-            }
-        }
-    };
-
     // 1. Compare v1 == v2 into vcc_lo, spill vcc_lo into v5 lane 0, restore
     //    into s6, combine with exec_lo via s_and_b32 into s7, and select
     //    between v3 (false) and v4 (true) via v_cndmask_b32.
@@ -2347,10 +2363,9 @@ fn spilled_lane_mask_restored_into_sop_and_select_matches_rdna2() {
         ([0, 0, 0xDEAD_BEEF, 0xCAFE_BABE], 0xCAFE_BABE),
         ([0, 1, 0xDEAD_BEEF, 0xCAFE_BABE], 0xDEAD_BEEF),
     ];
-    run_wave32("spilled mask select", &select_shader, select_cases);
+    run_restored_mask_cases("spilled mask select", &select_shader, 1, select_cases);
 
-    // 2. Also read the restored mask as a numeric dword (exercising
-    //    `mask_dword` through `st.restored`) and mask lane 0's bit.
+    // 2. Read the restored mask as a numeric dword and mask lane 0's bit.
     let dword_body: &[u32] = &[
         vop3(0x0C2, 0x6A, vgpr(1), vgpr(2), 0)[0], // v_cmp_eq_u32_e64 vcc_lo, v1, v2
         vop3(0x0C2, 0x6A, vgpr(1), vgpr(2), 0)[1],
@@ -2363,5 +2378,38 @@ fn spilled_lane_mask_restored_into_sop_and_select_matches_rdna2() {
     ];
     let dword_shader = build_valu_cs(dword_body);
     let dword_cases: &[([u32; 4], u32)] = &[([42, 42, 0, 0], 1), ([42, 43, 0, 0], 0)];
-    run_wave32("restored mask_dword", &dword_shader, dword_cases);
+    run_restored_mask_cases("restored mask_dword", &dword_shader, 1, dword_cases);
+}
+
+#[test]
+fn restored_mask_sop_scc_is_wave_uniform() {
+    // Select one lane with s0, spill and restore its compare mask, then test
+    // its first or last bit. Every lane observes the same scalar SCC.
+    let cases = [
+        ([0, 0, 0, 0], 7),
+        ([31, 0, 0, 0], 7),
+        ([1, 0, 0, 0], 11),
+        ([32, 0, 0, 0], 11),
+    ];
+    for (name, consumer) in [
+        (
+            "scalar branch",
+            &[s_mov_b32(12, 139), 0xBF84_0001, s_mov_b32(12, 135)][..],
+        ),
+        ("scalar select", &[sop2(0x0A, 12, 135, 139)][..]),
+    ] {
+        let mut words = vec![s_mov_b32(5, 128)];
+        words.extend(s_load_dwordx4(8, 4));
+        words.extend(vop3(0x0C2, 0x6A, sgpr(0), vgpr(0), 0));
+        words.extend(vop3(0x361, 5, sgpr(0x6A), 128, 0));
+        words.extend(vop3(0x360, 6, vgpr(5), 128, 0));
+        words.extend([sop2(0x0E, 7, 6, 255), 0x8000_0001]); // s_and_b32 s7, s6, bit 0 | bit 31
+        words.extend(consumer);
+        words.push(vop1(0x001, 1, sgpr(12)));
+        words.push(0x1A << 25 | 2 << 17 | 130); // v_lshlrev_b32 v2, 2, v0
+        let [store, addr] = buffer_store_dword(1, 8, 0);
+        words.extend([store | 1 << 12, addr | 2, S_ENDPGM]); // uav[v0] = v1
+        let shader = lower_cs32(&words, &[(4, ResourceType::Uav, 0, 4)], true);
+        run_restored_mask_cases(name, &shader, 32, &cases);
+    }
 }
