@@ -2477,6 +2477,174 @@ void main() {
         crate::shadow::unregister(buf2 as usize, p2 as u64);
     }
 
+    /// One compute list switches title -> fallback -> title. Both heaps hold
+    /// live raw views at the same indices, with different tagged input data.
+    #[test]
+    #[ignore = "requires a D3D12 device with Shader Model 6.6"]
+    fn view_strides_dispatch_switches_between_title_and_fallback_heaps() {
+        use victory_shader::emit::{VIEW_STRIDES, emit};
+        use victory_shader::native::{ComputeIo, HwStage, NativeProgram, RootParam, StageIo};
+        use victory_shader::{Container, io, ir, resource, structure};
+
+        let host = crate::host::host().expect("a D3D12 device");
+        // GFX10: s0 and s2 are the input and output heap indices; s1 names
+        // the resource heap. Each lane loads src[lane + 1] using the stride
+        // table, then stores to byte offset 4 * lane of the output.
+        let code: [u32; 16] = [
+            0x8f04_8500, // s_lshl_b32 s4, s0, 5
+            0xbe86_0301,
+            0xbe87_0380, // s[6:7] = heap base
+            0xf408_0203,
+            0x0800_0000, // s_load_dwordx4 s[8:11], s[6:7], s4
+            0x8f0c_8502, // s_lshl_b32 s12, s2, 5
+            0xf408_0403,
+            0x1800_0000, // s_load_dwordx4 s[16:19], s[6:7], s12
+            0x3402_0082,
+            0xbf8c_c07f, // v1 = lane * 4; wait lgkmcnt(0)
+            0xe030_2004,
+            0x8002_0200, // buffer_load_dword v2, v0, s[8:11], idxen offset:4
+            0xbf8c_3f70, // s_waitcnt vmcnt(0)
+            0xe070_1000,
+            0x8004_0201, // buffer_store_dword v2, v1, s[16:19], offen
+            0xbf81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: [
+                RootType::Constants,
+                RootType::ResourceHeap,
+                RootType::Constants,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, root)| RootParam {
+                root,
+                sgprs: 1,
+                user_data: i as u8,
+                slot: i as u8,
+                table_offset_dwords: 0,
+                base_register: 0,
+            })
+            .collect(),
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 3 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: code.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let program = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let flow = structure::structure(&program).unwrap();
+        let resources =
+            resource::track(&program, &native.layout, native.stage, Some(&flow)).unwrap();
+        let io = io::raise(&program, &native).unwrap();
+        let container = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let translated = emit(&container, &native, &program, &flow, &io, &resources).unwrap();
+        assert_eq!(translated.root_srvs, [VIEW_STRIDES]);
+        assert!(!translated.memory && !has_root_views(&translated));
+        let shader = crate::pipeline::Shader::for_test(
+            "compute",
+            crate::pipeline::Translated {
+                host: translated,
+                used: vec![],
+            },
+        );
+        let pso = HostPipeline::new(&[shader], None).expect("translated compute pipeline");
+
+        let fallback = crate::memory::heap().expect("fallback view heap");
+        let reserve = fallback.dynamic(4).expect("four free fallback slots");
+        let first = reserve + 1;
+        let (heap, _, title) = view_heap(first);
+        assert_eq!(title.dynamic(3), Some(first));
+        // Heap creation probes the device's maximum allocation before falling
+        // back to a smaller heap on adapters with a lower limit.
+        let _ = host.log_messages();
+        const SENTINEL: u32 = 0xcafe_beef;
+        let outputs = std::array::from_fn::<_, 3, _>(|_| {
+            let (buffer, bytes) = host.shared_buffer(40 * 4).unwrap();
+            // SAFETY: all 40 words are inside a new mapped output.
+            unsafe { std::slice::from_raw_parts_mut(bytes.cast::<u32>(), 40).fill(SENTINEL) };
+            (buffer, bytes)
+        });
+        for (views, tag, output) in [(title, 0x1100, 0), (fallback, 0x2200, 1)] {
+            let (input, bytes) = host.upload_buffer(33 * 4).unwrap();
+            // SAFETY: fill the 33 words of this live mapped input.
+            for (i, word) in unsafe { std::slice::from_raw_parts_mut(bytes.cast::<u32>(), 33) }
+                .iter_mut()
+                .enumerate()
+            {
+                *word = tag + i as u32;
+            }
+            views.raw_view_at(first, Some(&input), 0, 33 * 4, false);
+            // Raw buffer views start at a 16-byte boundary. Keep four guard
+            // words at either end of each result.
+            views.raw_view_at(first + 1, Some(&outputs[output].0), 16, 32 * 4, true);
+        }
+        title.raw_view_at(first + 2, Some(&outputs[2].0), 16, 32 * 4, true);
+
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        let mut bindings = Vec::new();
+        for (title_bound, dst) in [(true, first + 1), (false, first + 1), (true, first + 2)] {
+            state.set_heaps(if title_bound {
+                std::slice::from_ref(&heap)
+            } else {
+                &[]
+            });
+            state.set_constants(true, 0, &[first], 0);
+            state.set_constants(true, 2, &[dst], 0);
+            let bound = state.bind(&list, &pso, true);
+            let right_heap = state.host_heaps[0]
+                == if title_bound {
+                    heap as usize
+                } else {
+                    MEMORY_HEAP
+                };
+            bindings.push((bound, right_heap));
+            if bound && right_heap {
+                // SAFETY: State::bind installed this compute pipeline and
+                // its root arguments. Both indexed descriptors are live.
+                unsafe { list.list.Dispatch(1, 1, 1) };
+            }
+        }
+        list.close();
+        assert_eq!(host.log_messages(), None, "recording stride dispatches");
+        host.execute(&[&list]);
+        // SAFETY: a plain health query on a live D3D12 device.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        let mut matched = Vec::new();
+        for ((_, bytes), tag) in outputs.iter().zip([0x1100, 0x2200, 0x1100]) {
+            // SAFETY: the submission is complete; each mapping holds 40 words.
+            let words = unsafe { std::slice::from_raw_parts(bytes.cast::<u32>(), 40) };
+            assert_eq!(&words[..4], &[SENTINEL; 4]);
+            assert_eq!(&words[36..], &[SENTINEL; 4]);
+            let count = (0..32)
+                .filter(|&lane| words[lane + 4] == tag + lane as u32 + 1)
+                .count();
+            eprintln!(
+                "tag {tag:#x}: {count}/32, first={:#x} last={:#x}",
+                words[4], words[35]
+            );
+            matched.push(count);
+        }
+        for i in first..first + 3 {
+            fallback.make_null(i);
+            title.make_null(i);
+        }
+        fallback.release(reserve, 4);
+        title.release(first, 3);
+        crate::object::slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap);
+        eprintln!("(bind succeeded, expected heap selected): {bindings:?}");
+        assert_eq!(bindings, [(true, true); 3]);
+        assert_eq!(matched, [32; 3]);
+    }
+
     fn compile() -> (ID3D12RootSignature, ID3D12PipelineState) {
         compile_cs(SOURCE)
     }
