@@ -318,6 +318,8 @@ fn the_scc_a_waterfall_loop_leaves_is_false() {
     );
 }
 
+mod waterfall_scc_tests;
+
 #[test]
 fn v_fma_f16_rounds_once_and_preserves_other_half() {
     use super::host::Stride;
