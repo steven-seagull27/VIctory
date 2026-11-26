@@ -1278,20 +1278,7 @@ impl<'a> Lower<'a> {
                         .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[b_hi]);
                 let hi_first = self.s.m.bin(c, Bin::Add, hi_first, k32);
                 let first_lane = self.s.m.select(c, lo_nonempty, lo_first, hi_first);
-                let val = if float {
-                    let f = self.as_float(x);
-                    let f = self.ftz(f);
-                    self.as_int(f)
-                } else {
-                    x
-                };
-                let mut acc = if float {
-                    let f = self.as_float(id);
-                    let f = self.ftz(f);
-                    self.as_int(f)
-                } else {
-                    id
-                };
+                let mut acc = id;
                 for k in 0..64u32 {
                     let k_val = self.s.m.i32(k);
                     let word = if k < 32 { b_lo } else { b_hi };
@@ -1300,7 +1287,7 @@ impl<'a> Lower<'a> {
                     let bit = self.s.m.bin(c, Bin::And, bit, k1);
                     let k_active = self.s.m.cmp(c, pred::NE, bit, k0);
                     let safe_k = self.s.m.select(c, k_active, k_val, first_lane);
-                    let peer = self.read_lane(val, safe_k);
+                    let peer = self.read_lane(x, safe_k);
                     let in_range = if inclusive {
                         self.s.m.cmp(c, pred::IUGE, lane, k_val)
                     } else {
@@ -1321,6 +1308,9 @@ impl<'a> Lower<'a> {
                             let t = self.s.m.cmp(c, p, peer, acc);
                             self.s.m.select(c, t, peer, acc)
                         }
+                        // The guest copies lane zero before any DPP min/max can reach it.
+                        // Keep its payload until a real pair is combined by max_min.
+                        Op::MinF | Op::MaxF if k == 0 => peer,
                         Op::MinF | Op::MaxF => {
                             let (fa, fb) = (self.as_float(acc), self.as_float(peer));
                             let m = self.max_min(op == Op::MaxF, fa, fb);

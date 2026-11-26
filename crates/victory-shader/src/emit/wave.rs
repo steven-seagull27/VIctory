@@ -215,7 +215,10 @@ fn dpp_lane(d: Dpp, l: u32) -> Option<(u32, bool, bool)> {
 
 fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     match (a, b) {
-        (Sym::K(k), x) | (x, Sym::K(k)) if op.identity(k) => x,
+        // Even min(+inf, x) and max(-inf, x) can change a NaN or a denormal.
+        (Sym::K(k), x) | (x, Sym::K(k)) if op.identity(k) && !matches!(op, Op::MinF | Op::MaxF) => {
+            x
+        }
         (
             Sym::Red {
                 op: oa,
@@ -725,6 +728,13 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     }
     let (src, mask, ident, inclusive) = meta?;
     let op = op_found?;
+    // Float prefixes copy their singleton verbatim. min(x, x) and max(x, x)
+    // have the same contributing lane but still perform floating-point arithmetic.
+    if matches!(op, Op::MinF | Op::MaxF)
+        && !matches!(lanes[usize::from(!inclusive)], Sym::Red { op: None, .. })
+    {
+        return None;
+    }
     if !op.identity(ident) {
         return None;
     }
@@ -980,6 +990,37 @@ mod tests {
         let sec = &sections(&p, 0)[&0];
         assert_eq!(sec.shapes.get(&v2_val), Some(&Shape::K(7)));
         assert_eq!(sec.shapes.get(&v3_val), Some(&Shape::K(7)));
+    }
+
+    #[test]
+    fn float_prefix_requires_a_copied_singleton() {
+        let (src, mask) = (Value(1), Value(2));
+        for (op, ident) in [(Op::MinF, 0x7f80_0000), (Op::MaxF, 0xff80_0000)] {
+            let term = |op, lanes| Sym::Red {
+                op,
+                src,
+                mask,
+                ident,
+                lanes,
+            };
+            let first = term(None, 1);
+            assert_eq!(combine(op, first, Sym::K(ident)), Sym::Unknown);
+            for inclusive in [true, false] {
+                let i = usize::from(!inclusive);
+                let mut lanes: [Sym; 4] =
+                    std::array::from_fn(|lane| match lane + usize::from(inclusive) {
+                        0 => Sym::K(ident),
+                        1 => first,
+                        n => term(Some(op), (1 << n) - 1),
+                    });
+                assert_eq!(
+                    per_lane(&lanes, 15),
+                    Some(Shape::Prefix(op, src, mask, ident, inclusive))
+                );
+                lanes[i] = combine(op, first, first);
+                assert_eq!(per_lane(&lanes, 15), None);
+            }
+        }
     }
 
     #[test]

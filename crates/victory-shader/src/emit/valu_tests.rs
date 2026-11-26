@@ -2249,7 +2249,23 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
     );
 }
 
-fn build_wave_prefix_cs(vop2_op: u8, ident: u32, inclusive: bool, wave64: bool) -> HostShader {
+enum PrefixInputs {
+    MaskedPattern,
+    FirstAndRest,
+}
+
+fn build_wave_prefix_cs(
+    vop2_op: u8,
+    ident: u32,
+    inclusive: bool,
+    wave64: bool,
+    inputs: PrefixInputs,
+) -> HostShader {
+    let threads = if wave64 && matches!(inputs, PrefixInputs::FirstAndRest) {
+        64u8
+    } else {
+        32
+    };
     let sop1 = |sdst: u8, op: u8, src0: u8| -> u32 {
         0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | src0 as u32
     };
@@ -2270,13 +2286,21 @@ fn build_wave_prefix_cs(vop2_op: u8, ident: u32, inclusive: bool, wave64: bool) 
     w.push(s_mov_b32(5, 0x80));
     w.extend_from_slice(&s_load_dwordx4(8, 4));
 
-    // Per-lane input in v3 = ((v0 ^ s0) ^ (v0 << 17)) + s1
-    w.push(vop2_rr(0x1D, 3, sgpr(0), 0));
-    w.push(vop2_rr(0x1A, 4, 128 + 17, 0));
-    w.push(vop2_rr(0x1D, 3, vgpr(4), 3));
-    w.push(vop2_rr(0x25, 3, sgpr(1), 3));
+    match inputs {
+        PrefixInputs::MaskedPattern => {
+            // v3 = ((lane ^ s0) ^ (lane << 17)) + s1
+            w.push(vop2_rr(0x1D, 3, sgpr(0), 0));
+            w.push(vop2_rr(0x1A, 4, 128 + 17, 0));
+            w.push(vop2_rr(0x1D, 3, vgpr(4), 3));
+            w.push(vop2_rr(0x25, 3, sgpr(1), 3));
+        }
+        PrefixInputs::FirstAndRest => {
+            w.push(0x7D84_0080); // v_cmp_eq_u32 vcc, 0, v0
+            w.extend(vop3(0x101, 3, sgpr(1), sgpr(0), 106)); // v3 = lane == 0 ? s0 : s1
+        }
+    }
 
-    // Pre-fill uav[v0] = 0xDEAD_BEEF across all 32 lanes.
+    // Pre-fill uav[v0] = 0xDEAD_BEEF across all lanes.
     w.push(vop1(0x001, 5, 255));
     w.push(0xDEAD_BEEF);
     w.push(vop2_rr(0x1A, 6, 130, 0));
@@ -2285,9 +2309,16 @@ fn build_wave_prefix_cs(vop2_op: u8, ident: u32, inclusive: bool, wave64: bool) 
         0x80 << 24 | (8u32 >> 2) << 16 | 5 << 8 | 6,
     ]);
 
-    // Mask EXEC to lanes where (v0 & 3) != 0 (v_cmpx_lg_u32 exec, 0, v4).
+    // Keep lanes whose (v0 & 3) differs from 0 for the masked pattern, or from 4 for a full wave.
     w.push(vop2_rr(0x1B, 4, 131, 0));
-    w.push(0x7DAA_0880);
+    w.push(
+        0x7DAA_0880
+            | if matches!(inputs, PrefixInputs::FirstAndRest) {
+                4
+            } else {
+                0
+            },
+    );
 
     // Whole-wave section: s_or_saveexec_b64 s[0:1], -1 (wave64) or
     // s_or_saveexec_b32 s0, -1 (wave32). The wave32 variant only touches exec_lo.
@@ -2390,13 +2421,13 @@ fn build_wave_prefix_cs(vop2_op: u8, ident: u32, inclusive: bool, wave64: bool) 
             table_offset_dwords: 0,
             lower_bound: 0,
             stride: 0,
-            dwords: 32,
+            dwords: threads,
             user_data: 4,
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: (5 << 1) | (1 << 11),
-            threads: std::array::from_fn(|i| if i == 0 { 32 } else { 1 }),
+            threads: [u32::from(threads), 1, 1],
         }),
         code,
     };
@@ -2442,6 +2473,138 @@ fn build_wave_prefix_cs(vop2_op: u8, ident: u32, inclusive: bool, wave64: bool) 
     }
 
     shader
+}
+
+fn prefix_dispatch<'a>(
+    shader: &HostShader,
+    inputs: [u32; 4],
+    views: &'a [View<'a>],
+) -> Dispatch<'a> {
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        ud[u.index as usize] = match (u.root, u.slot) {
+            (RootType::Constants, 0) => inputs[u.dword as usize],
+            (RootType::Table, 1) => 0,
+            other => panic!("unexpected user data {other:?}"),
+        };
+    }
+    Dispatch {
+        roots: vec![(0, Root::Constants(ud))],
+        views,
+        samplers: &[],
+        groups: [1, 1, 1],
+    }
+}
+
+#[test]
+fn float_prefix_singletons_keep_their_bits() {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut checked, mut mismatches) = (0, 0);
+    let neg_zero = (-0.0f32).to_bits();
+    let one = 1.0f32.to_bits();
+    let two = 2.0f32.to_bits();
+    let pos_inf = f32::INFINITY.to_bits();
+    let neg_inf = f32::NEG_INFINITY.to_bits();
+    // First lane, every other lane, min and max after at least two lanes.
+    let cases = [
+        (0x7fc0_0001, one, one, one),
+        (0xffc1_2345, two, two, two),
+        (1, neg_zero, neg_zero, 0),
+        (0x8000_0001, 0, neg_zero, 0),
+        (0, neg_zero, neg_zero, 0),
+        (neg_zero, 0, neg_zero, 0),
+        (one, two, one, two),
+        (neg_inf, pos_inf, neg_inf, pos_inf),
+    ];
+    let warp_only = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    for (name, warp) in [("hardware", false), ("warp", true)] {
+        if warp_only && !warp {
+            continue;
+        }
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(error) => {
+                eprintln!("{name}: no device ({error}); skipped");
+                continue;
+            }
+        };
+        let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the live device writes an OPTIONS1 structure of the specified size.
+        unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut caps).cast(),
+                size_of_val(&caps) as u32,
+            )
+        }
+        .expect("query wave capabilities");
+        for width in [32, 64] {
+            if !caps.WaveOps.as_bool()
+                || !(caps.WaveLaneCountMin..=caps.WaveLaneCountMax).contains(&width)
+            {
+                eprintln!("{name}: Wave{width} unsupported; skipped");
+                continue;
+            }
+            let mut wrong = 0;
+            let mut lanes = 0;
+            for (opcode, ident) in [(0x0f, pos_inf), (0x10, neg_inf)] {
+                for inclusive in [true, false] {
+                    let shader = build_wave_prefix_cs(
+                        opcode,
+                        ident,
+                        inclusive,
+                        width == 64,
+                        PrefixInputs::FirstAndRest,
+                    );
+                    let (root, pso) = host
+                        .compute_pipeline(&shader)
+                        .expect("fixed-width pipeline");
+                    for (first, rest, min, max) in cases {
+                        let out = host
+                            .dispatch(
+                                &root,
+                                &pso,
+                                &prefix_dispatch(
+                                    &shader,
+                                    [first, rest, 0, 0],
+                                    &[View::RawUav(width)],
+                                ),
+                            )
+                            .expect("dispatch float prefix");
+                        for lane in 0..width {
+                            let terms = lane + u32::from(inclusive);
+                            let want = match terms {
+                                0 => ident,
+                                1 => first,
+                                _ if opcode == 0x0f => min,
+                                _ => max,
+                            };
+                            let got = out[0][lane as usize];
+                            if got != want {
+                                if wrong == 0 {
+                                    eprintln!(
+                                        "{name} Wave{width}, opcode {opcode:#x}, inclusive={inclusive}, lane {lane}: got {got:#010x}, want {want:#010x}"
+                                    );
+                                }
+                                wrong += 1;
+                            }
+                            lanes += 1;
+                        }
+                    }
+                }
+            }
+            eprintln!("{name} Wave{width}: {wrong}/{lanes} incorrect float prefix readbacks");
+            mismatches += wrong;
+            checked += lanes;
+        }
+    }
+    if std::env::var("VICTORY_REQUIRE_HW").is_ok_and(|v| v == "1") {
+        assert!(checked > 0, "no float prefix readbacks ran");
+    }
+    assert_eq!(mismatches, 0);
 }
 
 #[test]
@@ -2522,7 +2685,13 @@ fn wave_prefix_non_sum_ops_match_scan_across_lanes() {
         for (wave64, inclusive) in [(true, true), (true, false), (false, true), (false, false)] {
             let variant = if wave64 { "wave64" } else { "wave32" };
             let vi = usize::from(!wave64);
-            let shader = build_wave_prefix_cs(vop2_op, ident, inclusive, wave64);
+            let shader = build_wave_prefix_cs(
+                vop2_op,
+                ident,
+                inclusive,
+                wave64,
+                PrefixInputs::MaskedPattern,
+            );
             for (hi, (label, warp)) in [("hardware", false), ("warp", true)]
                 .into_iter()
                 .enumerate()
@@ -2544,24 +2713,11 @@ fn wave_prefix_non_sum_ops_match_scan_across_lanes() {
                 };
                 built[vi][hi] += 1;
                 for inputs in seeds {
-                    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-                    for u in &shader.user_data {
-                        ud[u.index as usize] = match (u.root, u.slot) {
-                            (RootType::Constants, 0) => inputs[u.dword as usize],
-                            (RootType::Table, 1) => 0,
-                            other => panic!("unexpected user data {other:?}"),
-                        };
-                    }
                     let out = host
                         .dispatch(
                             &root,
                             &pso,
-                            &Dispatch {
-                                roots: vec![(0, Root::Constants(ud))],
-                                views: &[View::RawUav(32)],
-                                samplers: &[],
-                                groups: std::array::from_fn(|_| 1),
-                            },
+                            &prefix_dispatch(&shader, inputs, &[View::RawUav(32)]),
                         )
                         .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
 
