@@ -14,47 +14,29 @@ impl Lower<'_> {
     /// dropped.
     pub(super) fn mark_lead(&mut self, n: V) -> Option<V> {
         self.s.flags |= flags::WAVE_OPS;
-        let c = self.cur;
         let (i1, i32t) = (self.s.t.i1, self.s.t.i32);
-        let (f, first) = if self.s.pixel {
+        let skip_helpers = if self.s.pixel {
             let helper = self
                 .s
-                .op(c, "isHelperLane.i1", Attr::ReadOnly, i1, 221, &[]);
-            let lane = self
-                .s
-                .op(c, "waveGetLaneIndex", Attr::ReadNone, i32t, 111, &[]);
-            let none = self.s.m.i32(u32::MAX);
-            let key = self.s.m.select(c, helper, none, lane);
-            // Operation 2, unsigned: the minimum.
-            let (min, unsigned) = (self.s.m.i8(2), self.s.m.i8(1));
-            let lead = self.s.op(
-                c,
-                "waveActiveOp.i32",
-                Attr::NoUnwind,
-                i32t,
-                119,
-                &[key, min, unsigned],
-            );
-            let f = self.s.op(
-                c,
-                "waveReadLaneAt.i32",
-                Attr::NoUnwind,
-                i32t,
-                117,
-                &[n, lead],
-            );
-            (f, self.s.m.cmp(c, pred::EQ, lane, lead))
+                .op(self.cur, "isHelperLane.i1", Attr::ReadOnly, i1, 221, &[]);
+            let no = self.s.m.bool(false);
+            let visible = self.s.m.cmp(self.cur, pred::EQ, helper, no);
+            self.begin_guarded(Some(visible))
         } else {
-            let f = self
-                .s
-                .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[n]);
-            (
-                f,
-                self.s
-                    .op(c, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]),
-            )
+            None
         };
+        // Only lanes that can perform the write take part in this election.
+        // An all-helper pixel wave skips both the election and the mark.
+        let c = self.cur;
+        let f = self
+            .s
+            .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[n]);
+        let first = self
+            .s
+            .op(c, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]);
         let differ = self.s.m.cmp(c, pred::NE, n, f);
-        Some(self.s.m.bin(c, Bin::Or, differ, first))
+        let mark = self.s.m.bin(c, Bin::Or, differ, first);
+        let no = self.s.m.bool(false);
+        Some(self.end_guarded(skip_helpers, &[(mark, no)])[0])
     }
 }
