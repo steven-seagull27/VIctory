@@ -1840,6 +1840,14 @@ impl<'a> Lower<'a> {
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_TRACE_EXEC_MOV").is_some() {
+            eprintln!(
+                "EXEC numeric: mask_dword({v:?}) in b{} entry_exec={}",
+                self.cur_ir,
+                self.x.p.inputs.contains(&(Reg::S(EXEC), v))
+            );
+        }
         let (lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
             None => (v, false),
@@ -3616,6 +3624,25 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
+        #[cfg(feature = "diagnostics")]
+        if name == "s_mov_b32"
+            && let Some(source) = inst.read(Reg::S(EXEC))
+            && std::env::var_os("VICTORY_TRACE_EXEC_MOV").is_some()
+        {
+            let route = if inst.write(Reg::S(EXEC)).is_some() {
+                "write to EXEC (structural)"
+            } else if self.is_mask(lo) {
+                "mask destination (structural)"
+            } else {
+                "numeric move"
+            };
+            eprintln!(
+                "EXEC move: wave{} b{} at {:#x} {} route={route}; src={source:?} entry={} src_mask={:?} dst={lo:?} dst_mask={:?} mask_ok={}",
+                if self.x.p.wave64 { 64 } else { 32 }, self.cur_ir, inst.machine.offset,
+                inst.machine.text(self.x.p.wave64), self.x.p.inputs.contains(&(Reg::S(EXEC), source)),
+                self.x.st.masks.get(&source), lo.and_then(|v| self.x.st.masks.get(&v)), self.mask_ok
+            );
+        }
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
             return Err(LANE_MASK);
         }
