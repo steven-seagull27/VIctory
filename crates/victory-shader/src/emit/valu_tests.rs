@@ -1766,6 +1766,77 @@ fn user_data_cs32(shader: &HostShader, k: u32) -> Vec<u32> {
     ud
 }
 
+#[test]
+fn guarded_readfirstlane_broadcasts_after_exec_is_restored() {
+    let mut words = vec![s_mov_b32(5, 128)]; // s5 = 0, high half of the descriptor table address
+    words.extend(s_load_dwordx4(8, 4));
+    words.extend([
+        0xBF8C_C07F,              // s_waitcnt lgkmcnt(0)
+        vop1(0x001, 1, vgpr(0)),  // v_mov_b32 v1, v0 (thread id)
+        0x3404_0282,              // v_lshlrev_b32 v2, 2, v1 (byte offset)
+        0x4A00_02B2,              // v_add_nc_u32 v0, 50, v1
+        s_mov_b32(12, 126),       // s_mov_b32 s12, exec_lo
+        0x7DA6_0282,              // v_cmpx_le_u32 exec_lo, 2, v1 (lanes 2..31)
+        vop1(0x002, 13, vgpr(0)), // v_readfirstlane_b32 s13, v0
+        s_mov_b32(126, 12),       // s_mov_b32 exec_lo, s12
+        0x7D88_0283,              // v_cmp_gt_u32 vcc_lo, 3, v1 (lanes 0..2)
+        0xBE8C_3C6A,              // s_and_saveexec_b32 s12, vcc_lo
+        sop2(0x12, 126, 126, 12), // s_xor_b32 exec_lo, exec_lo, s12 (lanes 3..31)
+        vop1(0x002, 14, vgpr(0)), // v_readfirstlane_b32 s14, v0
+        s_mov_b32(126, 12),       // s_mov_b32 exec_lo, s12
+        0x7DA4_02A0,              // v_cmpx_eq_u32 exec_lo, 32, v1 (no lanes)
+        vop1(0x002, 15, vgpr(0)), // v_readfirstlane_b32 s15, v0
+        s_mov_b32(126, 12),       // s_mov_b32 exec_lo, s12
+        vop1(0x002, 16, vgpr(0)), // v_readfirstlane_b32 s16, v0 (host wave's first value)
+    ]);
+    for (case, src) in (13..=16).enumerate() {
+        words.push(vop1(0x001, 3, sgpr(src))); // v_mov_b32 v3, s[src]
+        // buffer_store_dword v3, v2, s[8:11], 0 offen offset:128 * case
+        words.extend([0xE070_1000 | (128 * case as u32), 0x8002_0302]);
+    }
+    words.push(S_ENDPGM);
+
+    let shader = lower_cs32(&words, &[(4, ResourceType::Uav, 0, 4)], true);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let warp_only = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        if warp_only && !warp {
+            continue;
+        }
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(user_data_cs32(&shader, 0)))],
+                    views: &[View::RawUav(4 * 32)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let (results, first_values) = out[0].split_at(3 * 32);
+        // Host waves may be narrower than 32 lanes (e.g. WARP or Wave16 GPUs),
+        // though SM 6.0 guarantees at least 4 lanes, so lanes 0..4 share wave 0.
+        assert_eq!(&first_values[..4], &[50; 4], "{label}: first wave");
+        for (lane, &first) in first_values.iter().enumerate() {
+            let got = [results[lane], results[32 + lane], results[64 + lane]];
+            assert_eq!(
+                got,
+                [first.max(52), first.max(53), first],
+                "{label}: lane {lane}"
+            );
+        }
+    }
+}
+
 /// Image addresses with `a16` after a whole-VGPR operand (the offset or
 /// bias keeps a VGPR; the coordinates share the next) and the clamp of
 /// `image_sample_d_cl` (after the coordinates). Program 1: a biased sample
