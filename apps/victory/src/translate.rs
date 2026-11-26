@@ -568,8 +568,14 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    let marks = emit::Options { view_marks: true };
-                    match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
+                    let options = emit::Options {
+                        view_marks: true,
+                        warp_permute: checks
+                            .host
+                            .as_ref()
+                            .is_some_and(|(host, _)| host.is_software()),
+                    };
+                    match emit::emit_with(&container, &p, &program, &s, &i, &r, options) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);

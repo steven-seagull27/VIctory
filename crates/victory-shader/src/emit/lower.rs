@@ -97,9 +97,13 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with(parts, false)
+}
+
+pub(super) fn lower_with(parts: &Parts, warp_permute: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, warp_permute).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -187,6 +191,7 @@ type EntryAddress = (usize, u32);
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
+    warp_permute: bool,
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
@@ -543,7 +548,7 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, warp_permute: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -654,6 +659,7 @@ impl<'a> Lower<'a> {
         Lower {
             s,
             x,
+            warp_permute: warp_permute && x.native.stage == HwStage::Cs,
             bad,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
@@ -3103,6 +3109,44 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// On WARP 1.0.22, divergent WaveReadLaneAt can select the wrong
+    /// four-lane group. Hold the group constant in each read, then select
+    /// the requested group's result. See #2949.
+    fn read_lane_on_warp(&mut self, value: V, lane: V, active: [V; 2]) -> V {
+        let c = self.cur;
+        let me = self.lane_index();
+        let i32t = self.s.t.i32;
+        let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[me]);
+        let inner_mask = self.s.m.i32(3);
+        let outer_mask = self.s.m.i32(!3);
+        let inner = self.s.m.bin(c, Bin::And, lane, inner_mask);
+        let outer = self.s.m.bin(c, Bin::And, lane, outer_mask);
+        let zero = self.s.m.i32(0);
+        let one = self.s.m.i32(1);
+        let bank_mask = self.s.m.i32(15);
+        let bit = self.s.m.bin(c, Bin::Shl, one, inner);
+        let mut result = zero;
+        for start in (0..self.wave()).step_by(4) {
+            let base = self.s.m.i32(start);
+            let shift = self.s.m.i32(start % 32);
+            let mask = self.s.m.bin(c, Bin::LShr, active[(start / 32) as usize], shift);
+            let mask = self.s.m.bin(c, Bin::And, mask, bank_mask);
+            let nonempty = self.s.m.cmp(c, pred::NE, mask, zero);
+            let possible = self.s.m.bin(c, Bin::And, mask, bit);
+            let live = self.s.m.cmp(c, pred::NE, possible, zero);
+            let fallback = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[mask]);
+            let selected = self.s.m.select(c, live, inner, fallback);
+            let bank_lane = self.s.m.bin(c, Bin::Or, selected, base);
+            // An unselected read also needs a live host source. Use the
+            // wave's first lane for a group with no active source.
+            let source = self.s.m.select(c, nonempty, bank_lane, first);
+            let read = self.read_lane(value, source);
+            let requested = self.s.m.cmp(c, pred::EQ, outer, base);
+            result = self.s.m.select(c, requested, read, result);
+        }
+        result
+    }
+
     /// Whether `src` is active under the current `EXEC` mask (`guard` for
     /// straight-line narrowing, plus the host wave's live lanes for
     /// branch-structurised control flow). Returns `None` for unguarded pixel
@@ -3261,7 +3305,7 @@ impl<'a> Lower<'a> {
             } else {
                 within_half
             };
-            let r = self.read_lane(x, lane);
+            let direct = (!self.warp_permute).then(|| self.read_lane(x, lane));
             let on = guard.unwrap_or_else(|| self.s.m.bool(true));
             let i32t = self.s.t.i32;
             let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
@@ -3273,6 +3317,7 @@ impl<'a> Lower<'a> {
                 self.s.m.extract(c, ballot, 1),
             );
             let running = self.lane_bit_of(c, lane, lo, hi);
+            let r = direct.unwrap_or_else(|| self.read_lane_on_warp(x, lane, [lo, hi]));
             let z = k(self, 0);
             let r = self.s.m.select(c, running, r, z);
             let reg = dst_reg.ok_or("a permute result")?;

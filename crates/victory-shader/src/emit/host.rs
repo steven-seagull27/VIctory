@@ -109,7 +109,7 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
 
 /// Whether `device` runs on a software adapter (WARP); `true` when that
 /// cannot be told, so its work is serialised rather than raced.
-fn on_software_adapter(device: &ID3D12Device) -> bool {
+pub fn on_software_adapter(device: &ID3D12Device) -> bool {
     // SAFETY: plain D3D12/DXGI queries with valid pointers.
     unsafe {
         let luid = device.GetAdapterLuid();
@@ -159,6 +159,11 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
 static WARP_LOCK: Mutex<()> = Mutex::new(());
 
 impl Host {
+    /// Whether this host uses a software adapter.
+    pub fn is_software(&self) -> bool {
+        self.warp
+    }
+
     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
         self.warp
             .then(|| WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner()))

@@ -377,6 +377,8 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// Use four-lane reads for compute permutations on WARP.
+    pub warp_permute: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -502,14 +504,14 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let l = match lower::lower_with(&parts(st, res), options.warp_permute) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+            lower::lower_with(&parts(&st, &res), options.warp_permute)?
         }
         l => l?,
     };

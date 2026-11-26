@@ -65,10 +65,14 @@ fn program(whole: bool) -> Vec<u32> {
 }
 
 fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
-    build_wave(words, false)
+    build_wave_with(words, false, false)
 }
 
-fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderError> {
+fn build_wave_with(
+    words: &[u32],
+    wave64: bool,
+    warp_permute: bool,
+) -> Result<HostShader, crate::ShaderError> {
     let wave = if wave64 { 64 } else { 32 };
     let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
         kind,
@@ -103,7 +107,7 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let lowered = lowered(&native)?;
+    let lowered = lowered(&native, warp_permute)?;
     Ok(HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -126,12 +130,15 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
     })
 }
 
-fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {
+fn lowered(
+    native: &NativeProgram,
+    warp_permute: bool,
+) -> Result<lower::Lowered, crate::ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, native).expect("io::raise");
-    lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p: &p,
         st: &st,
@@ -142,7 +149,8 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
-    })
+    };
+    lower::lower_with(&parts, warp_permute)
 }
 
 /// The first texel of a footprint (see `Lower::gather_first`).
@@ -292,7 +300,7 @@ fn gathers_at_a_level_that_may_be_a_fraction_stop() {
 fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
     // Lanes below 24 run the permute; each reads lane (13 × lane + 5) mod 32
     // (its address in dwords, offset 20 bytes) of 1000 + lane.
-    let shader = build(&[
+    let program = [
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
         0xF408_0A02,
@@ -312,12 +320,7 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
         0xE070_1000,
         0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm
-    ])
-    .expect("lower");
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    }
+    ];
     let want: Vec<u32> = (0..32)
         .map(|l| match (13 * l + 5) % 32 {
             _ if l >= 24 => 0xDEAD,
@@ -341,9 +344,13 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        // The program declares the console's wave of 32, which WARP refuses.
+        let shader = build_wave_with(&program, false, host.is_software()).expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
         let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            assert!(warp, "{label}: no pipeline for a wave of 32");
+            assert!(host.is_software(), "{label}: no pipeline for a wave of 32");
             eprintln!("{label}: no pipeline for a wave of 32; skipped");
             continue;
         };
@@ -383,11 +390,6 @@ fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
         0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm
     ]);
-    let shader = build_wave(&words, wave64).expect("lower");
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    }
     let views = [
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Buffer {
@@ -404,10 +406,15 @@ fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        // Fixed WaveSize pipelines are refused by WARP, and WaveSize(64) by
-        // 32-lane hardware adapters.
+        let shader = build_wave_with(&words, wave64, host.is_software()).expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        // Older WARP rejects fixed sizes; WaveSize(64) also requires a
+        // 64-lane-capable hardware adapter.
         let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            assert!(warp || wave64, "{label}: no pipeline for a wave of 32");
+            assert!(host.is_software() || wave64, "{label}: no pipeline for a wave of 32");
             eprintln!("{label}: no pipeline for a wave of {wave}; skipped");
             continue;
         };
@@ -430,37 +437,40 @@ fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
 
 #[test]
 fn permutes_mask_high_address_bits_and_divergent_branches() {
-    // High byte-address bits (0x100) and sub-dword bits (+3) are ignored, so
-    // only bits 6:2 select the source lane. Lanes 16..31 skip the permute via
-    // `s_cbranch_execz`, so reads from them yield 0 while they keep `v3`.
-    let body = [
-        0x4A04_00FF,
-        0x0000_3000, // v_add_nc_u32 v2, 0x3000, v0
-        0x4A06_00FF,
-        0xBEEF_0000, // v_add_nc_u32 v3, 0xbeef0000, v0
-        0x4A02_0088, // v_add_nc_u32 v1, 8, v0
-        0x3402_0282, // v_lshlrev_b32 v1, 2, v1
-        0x4A02_02FF,
-        0x0000_0103, // v_add_nc_u32 v1, 0x103, v1
-        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
-        0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
-        0xBF88_0002, // s_cbranch_execz +2
-        0xDACC_0000,
-        0x0300_0201, // ds_bpermute_b32 v3, v1, v2
-        0xBEFE_0314, // s_mov_b32 exec_lo, s20
-    ];
-    let want: Vec<u32> = (0..32)
-        .map(|l| {
-            if l < 8 {
-                0x3000 + l + 8
-            } else if l < 16 {
-                0
-            } else {
-                0xBEEF_0000 + l
-            }
-        })
-        .collect();
-    run_permute_cs(false, &body, &want);
+    // High byte-address bits (0x100) and sub-dword bits (+3) are ignored,
+    // so only bits 6:2 select the source lane. Lanes above the cutoff skip
+    // the permute via `s_cbranch_execz` and keep their old destinations.
+    // Cut through a group of four in the second case.
+    for active in [16, 19] {
+        let body = [
+            0x4A04_00FF,
+            0x0000_3000, // v_add_nc_u32 v2, 0x3000, v0
+            0x4A06_00FF,
+            0xBEEF_0000, // v_add_nc_u32 v3, 0xbeef0000, v0
+            0x4A02_0088, // v_add_nc_u32 v1, 8, v0
+            0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+            0x4A02_02FF,
+            0x0000_0103, // v_add_nc_u32 v1, 0x103, v1
+            0x7D88_0080 | active, // v_cmp_gt_u32 vcc_lo, active, v0
+            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+            0xBF88_0002, // s_cbranch_execz +2
+            0xDACC_0000,
+            0x0300_0201, // ds_bpermute_b32 v3, v1, v2
+            0xBEFE_0314, // s_mov_b32 exec_lo, s20
+        ];
+        let want: Vec<u32> = (0..32)
+            .map(|l| {
+                if l + 8 < active {
+                    0x3000 + l + 8
+                } else if l < active {
+                    0
+                } else {
+                    0xBEEF_0000 + l
+                }
+            })
+            .collect();
+        run_permute_cs(false, &body, &want);
+    }
 }
 
 #[test]
@@ -843,14 +853,14 @@ fn ordered_pixel_sections_use_rasterizer_ordered_views() {
         },
         code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let l = lowered(&native(1 << 16)).expect("lower");
+    let l = lowered(&native(1 << 16), false).expect("lower");
     assert!(l.rovs);
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut l.dxil.clone())
             .expect("DXIL validation failed");
     }
     // Without the ordered mode the collision id is no value the host has.
-    let Err(crate::ShaderError::Unsupported { what, .. }) = lowered(&native(0)) else {
+    let Err(crate::ShaderError::Unsupported { what, .. }) = lowered(&native(0), false) else {
         panic!("translated a collision id outside an ordered section");
     };
     assert_eq!(what, "a hardware SGPR input");
