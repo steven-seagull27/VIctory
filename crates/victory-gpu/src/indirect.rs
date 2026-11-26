@@ -164,6 +164,9 @@ uint compute_clamped(uint kind, uint src_at, out uint2 draw_counts, out uint3 gr
         if (any(g > MESH_GROUPS)
                 || (g.z != 0 && g.x * g.y > MESH_GROUPS / max(g.z, 1u))) {
             g = min(g, uint3(MESH_GROUPS, 1u, 1u));
+        } else {
+            // A translated mesh reads only GroupID.x, as in the inline clamp.
+            g = uint3(g.x * g.y * g.z, 1u, 1u);
         }
         groups = g;
         return g.x * g.y * g.z * 128u;
@@ -1144,8 +1147,8 @@ mod tests {
             };
             assert_eq!(got, expected, "job {idx} hoisted output must match inline bound()");
             if idx == 7 {
-                // The first in-range mesh job retains its original three group counts.
-                assert_eq!(got, [10, 4, 3]);
+                // All 10 x 4 x 3 groups get distinct translated indices.
+                assert_eq!(got, [120, 1, 1]);
             }
             if idx >= 76 {
                 if got[0] == 1_000_000 {
