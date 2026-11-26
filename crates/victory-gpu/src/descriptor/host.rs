@@ -2180,3 +2180,7 @@ mod tests {
         assert_eq!(words[1..], [3 << 30, 255 | 599 << 14, 0xFAC | 10 << 16 | 13 << 28]);
     }
 }
+
+#[cfg(test)]
+#[path = "overlap_test.rs"]
+mod overlap_test;
