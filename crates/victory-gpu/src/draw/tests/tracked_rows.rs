@@ -105,12 +105,9 @@ fn mixed_pages_and_deferred_rows_reach_the_sampled_texture() {
     if crate::host::host().is_none() {
         return;
     }
-    // Both stay allocated so textures keyed by title address are distinct.
+    // Both stay allocated, as in the other draw tests: the tracked pages' guards\n    // outlive the textures, and a later test's pool at a freed address would\n    // never see its writes.
     let mixed = mixed_pages();
     let tracked = crate::watch::tests::pool(3);
     check_rows(mixed, true);
     check_rows(tracked, false);
-    crate::watch::tests::free(mixed);
-    crate::watch::tests::free(mixed + PAGE);
-    crate::watch::tests::free(tracked);
 }
