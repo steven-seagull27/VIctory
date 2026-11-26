@@ -400,10 +400,7 @@ impl HostPipeline {
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
-        let compute = match shaders {
-            [cs] if cs.stage == "compute" => Some(cs),
-            _ => None,
-        };
+        let compute = super::compute_shader(shaders);
         if compute.is_none()
             && shaders
                 .iter()

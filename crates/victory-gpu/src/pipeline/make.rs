@@ -283,7 +283,7 @@ static QUEUES: (Mutex<Queues>, Condvar) = (
 
 /// The queue of a pipeline a draw waits for (`now`) or started early.
 fn queue_index(p: &Pending, now: bool) -> usize {
-    usize::from(p.graphics.is_none()) + if now { 0 } else { 2 }
+    usize::from(super::compute_shader(&p.shaders).is_some()) + if now { 0 } else { 2 }
 }
 
 /// The pipeline workers (half the logical processors, 2 to 8), started on
@@ -429,15 +429,35 @@ fn drained() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_compute_only_stream_uses_the_compute_queue() {
+        for (stage, graphics, queue) in [
+            ("compute", None, 1),
+            ("compute", Some(Box::default()), 1),
+            ("vertex", Some(Box::default()), 0),
+        ] {
+            let p = Pending::new(
+                vec![Arc::new(Shader::new(stage, &[]))],
+                graphics,
+                #[cfg(feature = "diagnostics")]
+                &[],
+            );
+            assert_eq!(queue_index(&p, true), queue);
+            assert_eq!(queue_index(&p, false), queue + 2);
+        }
+    }
+
     /// The four queues in the order they are taken, and compute never
     /// taking the last worker.
     #[test]
     fn graphics_go_first_and_compute_leaves_a_worker() {
         let compute = |key: &str| {
-            #[cfg(feature = "diagnostics")]
-            let mut p = Pending::new(Vec::new(), None, &[]);
-            #[cfg(not(feature = "diagnostics"))]
-            let mut p = Pending::new(Vec::new(), None);
+            let mut p = Pending::new(
+                vec![Arc::new(Shader::new("compute", &[]))],
+                None,
+                #[cfg(feature = "diagnostics")]
+                &[],
+            );
             p.key = key.to_owned();
             Arc::new(p)
         };
