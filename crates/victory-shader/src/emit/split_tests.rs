@@ -659,26 +659,33 @@ fn masked_whole_wave_sum_straddles_the_halves() {
     });
 }
 
-/// A whole-wave section crosses the halves only in a group of exactly one
-/// console wave: with a partial upper half, or none, it still stops.
+/// A partial wave sums, minimizes, or maximizes just the threads present.
+/// Starting the values at 7 makes an incorrect minimum of zero observable.
 #[test]
-fn whole_wave_sections_in_partial_groups_still_stop() {
+fn whole_wave_reductions_in_partial_groups() {
     let nvidia = super::Target {
         lanes_min: 32,
         lanes_max: 32,
     };
-    let mut body = reduction_scan(37, 0x80);
-    body.push(0x7E04_020A); // v_mov_b32 v2, s10
-    assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    for threads in [48, 32] {
-        assert_eq!(
-            emit_for(&program(&body, threads), nvidia),
-            Err(crate::ShaderError::Unsupported {
-                offset: 0,
-                what: "a whole-wave section of a wave64 on a host without 64-lane waves",
-            }),
-            "{threads} threads"
-        );
+    for threads in [1, 6, 31, 32, 33, 36, 48, 63, 64] {
+        for (name, opcode, ident, expected) in [
+            ("sum", 37, 0x80, threads * (threads + 13) / 2),
+            ("min", 19, 0xc1, 7),
+            ("max", 20, 0x80, threads + 6),
+        ] {
+            let mut body = vec![
+                0x7E08_0300, // v_mov_b32 v4, v0 (save thread id)
+                0x4A00_0087, // v_add_nc_u32 v0, 7, v0
+            ];
+            body.extend(reduction_scan(opcode, ident));
+            body.extend([
+                0x7E00_0304, // v_mov_b32 v0, v4 (restore output index)
+                0x7E04_020A, // v_mov_b32 v2, s10
+            ]);
+            let p = program(&body, threads);
+            emit_for(&p, nvidia).unwrap();
+            program_case(name, &p, |_| expected, true);
+        }
     }
 }
 

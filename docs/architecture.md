@@ -109,8 +109,8 @@ lists what they cannot handle yet.
 On a 32-lane host, eligible wave64 compute programs run in two 32-lane
 halves. In a single-wave thread group, the console's control flow uses
 group barriers for cross-half exchanges and shared LDS accesses.
-`ds_permute_b32`, which is not translated yet, and whole-wave sections in
-partial groups can prevent splitting (`ds_bpermute_b32` does not: it
-gathers within each 32-lane half).
+Whole-wave reductions in a partial group combine the halves that contain
+threads. `ds_permute_b32` still prevents splitting. `ds_bpermute_b32`
+gathers within each 32-lane half.
 Translation refuses programs by name if their required wave size falls
 outside the host's range.
