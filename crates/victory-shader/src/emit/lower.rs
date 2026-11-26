@@ -23,6 +23,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 mod bvh;
 
 type Why = &'static str;
+#[path = "mask_trace.rs"]
+mod mask_trace;
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
@@ -98,15 +100,23 @@ enum Stop {
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     #[cfg(feature = "diagnostics")]
+    let mut mask_trace = mask_trace::MaskTrace::new();
+    #[cfg(feature = "diagnostics")]
     let mut passes = 0u32;
     loop {
         #[cfg(feature = "diagnostics")]
         {
             passes += 1;
+            mask_trace.begin_pass();
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        let made = Lower::new(parts, &bad);
+        let made = Lower::new(
+            parts,
+            &bad,
+            #[cfg(feature = "diagnostics")]
+            &mut mask_trace,
+        );
         #[cfg(feature = "diagnostics")]
         let setup = started.elapsed();
         #[cfg(feature = "diagnostics")]
@@ -215,6 +225,8 @@ struct Lower<'a> {
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
+    #[cfg(feature = "diagnostics")]
+    mask_trace: &'a mut mask_trace::MaskTrace,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
     /// Values (missing in `vals`) whose low 16 bits are known: a 16-bit
@@ -569,7 +581,11 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        #[cfg(feature = "diagnostics")] mask_trace: &'a mut mask_trace::MaskTrace,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -682,6 +698,8 @@ impl<'a> Lower<'a> {
             x,
             bad,
             lane_fail: HashMap::new(),
+            #[cfg(feature = "diagnostics")]
+            mask_trace,
             vals: HashMap::new(),
             floats: HashMap::new(),
             low16: HashMap::new(),
@@ -1349,7 +1367,8 @@ impl<'a> Lower<'a> {
         self.find_sections();
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
-            self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
+            self.mesh_prologue(mesh)
+                .map_err(|w| self.traced_refusal(0, w, "mesh prologue"))?;
             self.block[order[0]] = Some(self.cur);
         }
         for &b in &order {
@@ -1388,7 +1407,7 @@ impl<'a> Lower<'a> {
                     let offset = p.blocks[b].insts[i].machine.offset;
                     let kill = self
                         .boolean(lanes, at)
-                        .map_err(|w| unsupported(offset, w))?;
+                        .map_err(|w| self.traced_refusal(offset, w, "discard condition"))?;
                     self.s
                         .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
                 }
@@ -1668,7 +1687,13 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
-            Some(&Val::Missing(w)) => return Err(w),
+            Some(&Val::Missing(w)) => {
+                #[cfg(feature = "diagnostics")]
+                if w == LANE_MASK {
+                    self.mask_trace.missing(v);
+                }
+                return Err(w);
+            }
             Some(&val) => return Ok(val),
             None => {}
         }
@@ -1680,7 +1705,7 @@ impl<'a> Lower<'a> {
         Err("a value defined after its use")
     }
 
-    fn i32_of(&mut self, v: Value) -> Result<V, Why> {
+    fn i32_of_inner(&mut self, v: Value) -> Result<V, Why> {
         match self.get(v)? {
             Val::I32(x) => Ok(x),
             Val::Bit(x) => Ok(self.s.m.cast(self.cur, Cast::ZExt, x, self.s.t.i32)),
@@ -1839,7 +1864,7 @@ impl<'a> Lower<'a> {
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
-    fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
+    fn mask_dword_inner(&mut self, v: Value) -> Result<V, Why> {
         let (lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
             None => (v, false),
@@ -1882,7 +1907,7 @@ impl<'a> Lower<'a> {
     /// writing it (a complement, a copy made where EXEC is not known), so
     /// no ballot there gives it: with console lanes, the scalar operation
     /// that writes it applied to its operands' numbers, as the console does.
-    fn mask_number(&mut self, lo: Value) -> Result<(V, V), Why> {
+    fn mask_number_inner(&mut self, lo: Value) -> Result<(V, V), Why> {
         const ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
         if self.mask_data != MaskData::Console {
             return Err(ELSEWHERE);
@@ -2584,13 +2609,19 @@ impl<'a> Lower<'a> {
         Ok(v)
     }
 
-    fn atom(&mut self, atom: Atom, at: usize) -> Result<V, Why> {
+    fn atom_inner(&mut self, atom: Atom, at: usize) -> Result<V, Why> {
         match atom {
             Atom::Lane(v) => self.lane_bits.get(&v).copied().ok_or_else(|| {
-                self.lane_fail
+                let why = self
+                    .lane_fail
                     .get(&v)
                     .copied()
-                    .unwrap_or("a lane mask from a carry")
+                    .unwrap_or("a lane mask from a carry");
+                #[cfg(feature = "diagnostics")]
+                if why == LANE_MASK {
+                    self.mask_trace.missing(v);
+                }
+                why
             }),
             Atom::Uniform(v) => match self.get(v)? {
                 Val::Bit(x) => Ok(x),
@@ -3528,6 +3559,8 @@ impl<'a> Lower<'a> {
     // ---- instructions ----
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
+        #[cfg(feature = "diagnostics")]
+        self.mask_trace.clear_read();
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
@@ -3581,8 +3614,12 @@ impl<'a> Lower<'a> {
         };
         match r {
             Ok(()) => Ok(()),
-            Err(why) if effect => Err(unsupported(offset, why)),
+            Err(why) if effect => Err(self.traced_refusal(offset, why, "effectful instruction")),
             Err(why) => {
+                #[cfg(feature = "diagnostics")]
+                if why == LANE_MASK {
+                    self.mask_trace.propagate(inst);
+                }
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }
@@ -10176,6 +10213,8 @@ impl<'a> Lower<'a> {
     }
 
     fn exit(&mut self, b: usize) -> Result<(), Stop> {
+        #[cfg(feature = "diagnostics")]
+        self.mask_trace.clear_read();
         let offset = self.x.p.blocks[b]
             .insts
             .last()
@@ -10200,13 +10239,13 @@ impl<'a> Lower<'a> {
                     Some((atom, Bool::TRUE, Bool::FALSE)) => {
                         let a = self
                             .atom(atom, self.cur)
-                            .map_err(|w| unsupported(offset, w))?;
+                            .map_err(|w| self.traced_refusal(offset, w, "exit/atom"))?;
                         (a, not_taken, taken)
                     }
                     _ => {
                         let c = self
                             .boolean(when, self.cur)
-                            .map_err(|w| unsupported(offset, w))?;
+                            .map_err(|w| self.traced_refusal(offset, w, "exit/boolean"))?;
                         (c, taken, not_taken)
                     }
                 };
@@ -10866,6 +10905,8 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                #[cfg(feature = "diagnostics")]
+                self.mask_trace.clear_read();
                 let read = live.contains(&(phi.value, n));
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
@@ -10899,10 +10940,11 @@ impl<'a> Lower<'a> {
                         && (self.x.st.masks.contains_key(&arg) || self.x.st.highs.contains_key(&arg))
                         && self.uniform_join(b) =>
                     {
-                        self.mask_dword(arg).map_err(|w| Stop::Retry(phi.value, w))?
+                        self.mask_dword(arg)
+                            .map_err(|w| self.trace_retry(phi.value, arg, w))?
                     }
                     (Some(Val::Missing(why)), _) if read => {
-                        return Err(Stop::Retry(phi.value, why));
+                        return Err(self.trace_retry(phi.value, arg, why));
                     }
                     _ if read => {
                         return Err(Stop::Retry(phi.value, "a join of mismatched values"));
@@ -10925,13 +10967,17 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                #[cfg(feature = "diagnostics")]
+                self.mask_trace.clear_read();
                 const UNTRACKED: Why = "a lane-mask join of an untracked mask";
                 // Data joined with masks where the wave takes one edge (the BVH
                 // walks pop masks from memory): with console lanes the lane's
                 // own bit of the number, as `Atom::Opaque`.
                 let number = self.console_lanes && !self.x.native.wave64 && self.uniform_join(b);
                 let x = match (self.x.st.masks.get(&arg), self.vals.get(&arg)) {
-                    (Some(&m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
+                    (Some(&m), _) => self
+                        .boolean(m, qb)
+                        .map_err(|w| self.traced_refusal(offset, w, "mask phi/boolean"))?,
                     (None, Some(&Val::I32(word))) if number => self.lane_bit(qb, word, None),
                     (None, _) if !self.uniform_join(b) && self.no_mask_lane_on_edge(b, &phi.args, n) => {
                         self.s.m.bool(false)
