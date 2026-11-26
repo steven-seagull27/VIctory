@@ -880,6 +880,9 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 }
 
 #[cfg(test)]
+mod packed_retry_test;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
