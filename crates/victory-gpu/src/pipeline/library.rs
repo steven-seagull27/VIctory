@@ -475,8 +475,13 @@ pub(crate) fn wanted_early(key: &str) -> bool {
     used().as_ref().is_some_and(|u| u.before.contains_key(key))
 }
 
+#[cfg(test)]
+pub(crate) static PROBE_RECORDS: AtomicU64 = AtomicU64::new(0);
+
 /// The title pipeline with `key` was drawn or dispatched with.
 pub(crate) fn note_used(key: &str) {
+    #[cfg(test)]
+    PROBE_RECORDS.fetch_add(1, Ordering::Relaxed);
     if used().get_or_insert_with(Used::default).now.insert(key.to_owned()) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }

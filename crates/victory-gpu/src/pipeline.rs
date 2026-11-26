@@ -239,6 +239,8 @@ pub(crate) fn bound(this: This) {
     if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    #[cfg(test)]
+    PROBE_BINDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let frame = crate::frame::current();
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
@@ -901,3 +903,6 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod depth_bounds_test;
+
+#[cfg(test)]
+static PROBE_BINDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

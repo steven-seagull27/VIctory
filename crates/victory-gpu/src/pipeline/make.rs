@@ -86,6 +86,8 @@ impl Pending {
 
     fn make(&self) {
         self.made.get_or_init(|| {
+            #[cfg(test)]
+            PROBE_BUILDS.fetch_add(1, Ordering::Relaxed);
             let (started, cpu) = (Instant::now(), super::thread_cpu());
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             #[cfg(feature = "diagnostics")]
@@ -452,3 +454,8 @@ mod tests {
         assert!(shader.translated.get().is_none());
     }
 }
+
+#[cfg(test)]
+static PROBE_BUILDS: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod contention_fixture;
