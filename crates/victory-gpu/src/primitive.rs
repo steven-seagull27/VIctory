@@ -39,8 +39,8 @@ pub(crate) fn rectangle_corners(
 }
 
 /// Expands each rectangle into two triangles using the draw's corner order.
-/// The first triangle is (v0, v1, v2), and the second is (va, vb, va + vb - vc)
-/// around right angle vc. Without a position to choose from, vc is v1.
+/// Both triangles have the input winding and share v0 as their leading vertex.
+/// Without a position to choose from, the right angle is v1.
 pub(crate) fn expand_rects_with_corners(
     src: &[u8],
     dst: &mut [u8],
@@ -62,11 +62,14 @@ pub(crate) fn expand_rects_with_corners(
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
         let right = usize::from(corners.get(i).copied().unwrap_or(1));
         let (a, b) = ((right + 2) % 3, (right + 1) % 3);
-        for (slot, i) in [0, 1, 2, a, b].into_iter().enumerate() {
-            out[slot * stride..(slot + 1) * stride].copy_from_slice(v(i));
-        }
-        let fourth = &mut out[5 * stride..];
-        fourth.copy_from_slice(v(a));
+        let (order, fourth_slot) = match right {
+            0 => ([0, 1, 3, 0, 3, 2], 2),
+            2 => ([0, 1, 2, 0, 3, 1], 4),
+            _ => ([0, 1, 2, 0, 2, 3], 5),
+        };
+        let fourth_range = fourth_slot * stride..(fourth_slot + 1) * stride;
+        let fourth = &mut out[fourth_range.clone()];
+        fourth.copy_from_slice(v(0));
         for &(offset, format) in elements {
             let at = offset as usize;
             let Some((n, kind)) = components(format) else {
@@ -79,6 +82,13 @@ pub(crate) fn expand_rects_with_corners(
                 let get = |i: usize| kind.read(&v(i)[at..], c);
                 let value = get(a) + get(b) - get(right);
                 kind.write(&mut fourth[at..], c, value);
+            }
+        }
+        for (slot, &corner) in order.iter().enumerate() {
+            if corner < 3 {
+                out[slot * stride..(slot + 1) * stride].copy_from_slice(v(corner));
+            } else if slot != fourth_slot {
+                out.copy_within(fourth_range.clone(), slot * stride);
             }
         }
     }
@@ -246,7 +256,7 @@ mod tests {
 
     /// The tiled lighting's order (top left, bottom left, top right: the
     /// right angle first) completes at the bottom right, the second
-    /// triangle (v2, v1, v3); a triangle that is no rectangle's keeps its
+    /// triangle (v0, v3, v2); a triangle that is no rectangle's keeps its
     /// winding in both halves.
     #[test]
     fn rectangles_complete_opposite_their_right_angle() {
@@ -254,7 +264,7 @@ mod tests {
         let src = [vertex(0.0, 0.0), vertex(0.0, 1.0), vertex(1.0, 0.0)].concat();
         let mut dst = vec![0u8; 6 * 8];
         expand_rects(&src, &mut dst, 8, &[(0, 16)]);
-        assert_eq!(dst[24..], [&src[16..24], &src[8..16], &vertex(1.0, 1.0)[..]].concat()[..]);
+        assert_eq!(dst[24..], [&src[..8], &vertex(1.0, 1.0)[..], &src[16..24]].concat()[..]);
         let read = |d: &[u8], i: usize| {
             let f = |k: usize| f32::from_le_bytes(d[i * 8 + k * 4..i * 8 + k * 4 + 4].try_into().unwrap());
             [f(0), f(1)]
@@ -266,6 +276,27 @@ mod tests {
         let src = [vertex(0.0, 0.0), vertex(3.0, 1.0), vertex(1.0, 0.0)].concat();
         expand_rects(&src, &mut dst, 8, &[(0, 16)]);
         assert!(turn(&dst, 0) * turn(&dst, 3) > 0.0, "same winding");
+    }
+
+    #[test]
+    fn both_triangles_keep_v0_for_every_right_angle_and_winding() {
+        let (tl, bl, tr) = ([0f32, 0.0], [0.0, 1.0], [1.0, 0.0]);
+        let vertex = |[x, y]: [f32; 2], tag: u32| [x.to_le_bytes(), y.to_le_bytes(), tag.to_le_bytes()].concat();
+        for (points, order) in [
+            ([tl, bl, tr], [0, 1, 3, 0, 3, 2]),
+            ([tr, tl, bl], [0, 1, 2, 0, 2, 3]),
+            ([bl, tr, tl], [0, 1, 2, 0, 3, 1]),
+        ] {
+            for mirror in [1.0, -1.0] {
+                let [a, b, c] = points.map(|[x, y]| [x * mirror, y]);
+                let corners = [vertex(a, 7), vertex(b, 11), vertex(c, 17), vertex([mirror, 1.0], 7)];
+                let mut dst = [0; 6 * 12];
+                expand_rects(&corners[..3].concat(), &mut dst, 12, &[(0, 16), (8, 42)]);
+                for (got, i) in dst.as_chunks::<12>().0.iter().zip(order) {
+                    assert_eq!(got.as_slice(), corners[i]);
+                }
+            }
+        }
     }
 
     /// A rounding that carries out of the mantissa raises the exponent
@@ -357,8 +388,8 @@ mod tests {
     fn unorm16_unorm8_clamping_and_unknown_formats_expand_correctly() {
         // Vertex layout (12 bytes):
         //   0..4: R16G16_UNORM (format 35)
-        //   4..8: R8G8B8A8_UNORM (format 28) — tests clamping below 0 and above 1
-        //   8..12: unknown format (999) — must keep v0's bytes verbatim
+        //   4..8: R8G8B8A8_UNORM (format 28) â€” tests clamping below 0 and above 1
+        //   8..12: unknown format (999) â€” must keep v0's bytes verbatim
         let v = |u0: u16, u1: u16, c: [u8; 4], raw: [u8; 4]| {
             let mut b = Vec::with_capacity(12);
             b.extend(u0.to_le_bytes());
