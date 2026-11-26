@@ -90,8 +90,9 @@ pub(crate) struct Parts<'a> {
 }
 
 enum Stop {
-    /// A phi whose incoming value has no DXIL form was read: redo with it missing.
-    Retry(Value, Why),
+    /// Phis whose incoming value has no DXIL form were read: redo with them
+    /// missing.
+    Retry(Vec<(Value, Why)>),
     Fail(ShaderError),
 }
 
@@ -128,8 +129,12 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
                 }
                 return Ok(l);
             }
-            Err(Stop::Retry(v, why)) => {
-                if bad.insert(v, why).is_some() {
+            Err(Stop::Retry(values)) => {
+                let mut fresh = false;
+                for (v, why) in values {
+                    fresh |= bad.insert(v, why).is_none();
+                }
+                if !fresh {
                     return Err(ShaderError::Unsupported {
                         offset: 0,
                         what: "a phi that does not settle",
@@ -214,6 +219,9 @@ struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
+    /// Phis this pass could not join: the pass is thrown away and redone
+    /// with all of them missing (`Stop::Retry`).
+    retried: Vec<(Value, Why)>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
@@ -681,6 +689,7 @@ impl<'a> Lower<'a> {
             s,
             x,
             bad,
+            retried: Vec::new(),
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
             floats: HashMap::new(),
@@ -10862,55 +10871,83 @@ impl<'a> Lower<'a> {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
             let mut incoming = Vec::new();
+            let mut retry: Option<Vec<(Value, Why)>> = None;
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                if retry.is_some() {
+                    continue;
+                }
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 let read = live.contains(&(phi.value, n));
-                let x = match (self.vals.get(&arg).copied(), bit) {
-                    (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    // No lane from this edge reads it, or no lane comes
-                    // along it at all: any value will do.
-                    _ if read
-                        && (self.never_taken(q, b) || self.dead_on_edge(b, n, phi.reg)) =>
-                    {
-                        if bit {
-                            self.s.m.bool(false)
-                        } else {
-                            self.s.m.i32(0)
+                let edge = (|| -> Result<V, Stop> {
+                        Ok(match (self.vals.get(&arg).copied(), bit) {
+                        (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
+                        // No lane from this edge reads it, or no lane comes
+                        // along it at all: any value will do.
+                        _ if read
+                            && (self.never_taken(q, b) || self.dead_on_edge(b, n, phi.reg)) =>
+                        {
+                            if bit {
+                                self.s.m.bool(false)
+                            } else {
+                                self.s.m.i32(0)
+                            }
                         }
+                        // An input an unguarded counted `v_movreld` loop overwrites
+                        // before anything reads it (PR #457).
+                        (Some(Val::Missing("barycentrics read directly")), false)
+                            if read && self.overwritten_movreld_edge(b, phi, n).is_some() =>
+                        {
+                            self.s.m.undef(self.s.t.i32)
+                        }
+                        (Some(Val::Bit(_)), false) if read => {
+                            return Err(Stop::Retry(vec![(phi.value, "an SCC joined with SGPR values")]));
+                        }
+                        // A lane mask joined with data at a join every lane
+                        // enters along one edge: the register holds the mask's
+                        // number there (console lanes, so exact).
+                        _ if read
+                            && !bit
+                            && self.mask_data == MaskData::Console
+                            && (self.x.st.masks.contains_key(&arg) || self.x.st.highs.contains_key(&arg))
+                            && self.uniform_join(b) =>
+                        {
+                            self.mask_dword(arg).map_err(|w| Stop::Retry(vec![(phi.value, w)]))?
+                        }
+                        (Some(Val::Missing(why)), _) if read => {
+                            return Err(Stop::Retry(vec![(phi.value, why)]));
+                        }
+                        _ if read => {
+                            return Err(Stop::Retry(vec![(phi.value, "a join of mismatched values")]));
+                        }
+                            _ if bit => self.s.m.bool(false),
+                            _ => self.s.m.i32(0),
+                        })
+                })();
+                match edge {
+                    Ok(x) => incoming.push((x, qb)),
+                    Err(Stop::Retry(values)) => {
+                        retry = Some(values);
+                        break;
                     }
-                    // An input an unguarded counted `v_movreld` loop overwrites
-                    // before anything reads it (PR #457).
-                    (Some(Val::Missing("barycentrics read directly")), false)
-                        if read && self.overwritten_movreld_edge(b, phi, n).is_some() =>
-                    {
-                        self.s.m.undef(self.s.t.i32)
-                    }
-                    (Some(Val::Bit(_)), false) if read => {
-                        return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
-                    }
-                    // A lane mask joined with data at a join every lane
-                    // enters along one edge: the register holds the mask's
-                    // number there (console lanes, so exact).
-                    _ if read
-                        && !bit
-                        && self.mask_data == MaskData::Console
-                        && (self.x.st.masks.contains_key(&arg) || self.x.st.highs.contains_key(&arg))
-                        && self.uniform_join(b) =>
-                    {
-                        self.mask_dword(arg).map_err(|w| Stop::Retry(phi.value, w))?
-                    }
-                    (Some(Val::Missing(why)), _) if read => {
-                        return Err(Stop::Retry(phi.value, why));
-                    }
-                    _ if read => {
-                        return Err(Stop::Retry(phi.value, "a join of mismatched values"));
-                    }
-                    _ if bit => self.s.m.bool(false),
-                    _ => self.s.m.i32(0),
-                };
-                incoming.push((x, qb));
+                    Err(e) => return Err(e),
+                }
+            }
+            if let Some(values) = retry {
+                self.retried.extend(values);
+                let value = if bit { self.s.m.bool(false) } else { self.s.m.undef(self.s.t.i32) };
+                let edges: Vec<(V, usize)> = p.blocks[b]
+                    .preds
+                    .iter()
+                    .filter_map(|&q| {
+                        let qb = self.tail[q]?;
+                        let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                        Some((value, qb))
+                    })
+                    .collect();
+                self.s.m.set_phi(v, edges);
+                continue;
             }
             self.s.m.set_phi(v, incoming);
         }
@@ -10941,6 +10978,9 @@ impl<'a> Lower<'a> {
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
+        }
+        if !self.retried.is_empty() {
+            return Err(Stop::Retry(std::mem::take(&mut self.retried)));
         }
         Ok(())
     }
