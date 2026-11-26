@@ -38,8 +38,17 @@ pub fn build(
     wave64: bool,
     vgprs: u16,
 ) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
-    let p = ir::build(code, wave64, vgprs)?;
-    let st = structure::structure(&p);
+    build_timed(code, wave64, vgprs, &mut Default::default())
+}
+
+pub(crate) fn build_timed(
+    code: &[u8],
+    wave64: bool,
+    vgprs: u16,
+    times: &mut crate::timing::Timings,
+) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
+    let p = times.measure("ir", || ir::build(code, wave64, vgprs))?;
+    let st = times.measure("structure", || structure::structure(&p));
     let mut assumed: HashMap<usize, u8> = p
         .blocks
         .iter()
@@ -55,11 +64,11 @@ pub fn build(
         if assumed.is_empty() {
             break;
         }
-        let q = ir::build_bounded(code, wave64, vgprs, &assumed)?;
-        let Ok(s) = structure::structure(&q) else {
+        let q = times.measure("bounded_ir", || ir::build_bounded(code, wave64, vgprs, &assumed))?;
+        let Ok(s) = times.measure("bounded_structure", || structure::structure(&q)) else {
             break;
         };
-        let found = relative_bounds(&q, &s);
+        let found = times.measure("relative_bounds", || relative_bounds(&q, &s));
         let proven: HashMap<usize, u8> = assumed
             .iter()
             .filter_map(|(&o, &m)| Some((o, u8::try_from(found[&o]).ok().filter(|&f| f <= m)?)))
@@ -68,8 +77,8 @@ pub fn build(
             if proven == assumed {
                 return Ok((q, Ok(s)));
             }
-            let q = ir::build_bounded(code, wave64, vgprs, &proven)?;
-            let s = structure::structure(&q);
+            let q = times.measure("bounded_ir", || ir::build_bounded(code, wave64, vgprs, &proven))?;
+            let s = times.measure("bounded_structure", || structure::structure(&q));
             return Ok((q, s));
         }
         assumed = assumed

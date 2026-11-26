@@ -10,12 +10,13 @@ publish.workspace = true
 [dependencies]
 thiserror.workspace = true
 miniz_oxide.workspace = true
+tracing = { workspace = true, optional = true }
 
 [features]
 # Host D3D12 pipeline checks (`emit::host`).
 host = ["dep:windows"]
 # Debugging switches (emitted-module dumps and the like).
-diagnostics = []
+diagnostics = ["dep:tracing"]
 
 [[bench]]
 name = "guard_runs"

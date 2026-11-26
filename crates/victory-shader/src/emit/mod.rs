@@ -385,62 +385,41 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// [`translate`] made as `options` say.
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
-    #[cfg(feature = "diagnostics")]
-    let mut phases = std::time::Instant::now();
-    #[cfg(feature = "diagnostics")]
-    let mut marks = Vec::new();
-    #[cfg(feature = "diagnostics")]
-    let mark = |what: &'static str, phases: &mut std::time::Instant, marks: &mut Vec<(&'static str, u128)>| {
-        let now = std::time::Instant::now();
-        marks.push((what, now.duration_since(*phases).as_micros()));
-        *phases = now;
-    };
-    let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .or(c.part(FourCC::ACCC))
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
-            )
-        })
-        .ok_or(ShaderError::Unsupported {
-            offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
-        })?;
+    let mut phases = crate::timing::Timings::for_translation();
+    let mut range_phases = crate::timing::Timings::for_translation();
+    let c = phases.measure("parse", || Container::parse(container))?;
+    let native = phases.measure("native", || {
+        let dxil = c
+            .part(FourCC::DXIL)
+            .or(c.part(FourCC::ACCC))
+            .ok_or(ShaderError::Malformed("no DXIL part"))?;
+        crate::native_programs(dxil.data)?
+            .into_iter()
+            .find(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms))
+            .ok_or(ShaderError::Unsupported {
+                offset: 0,
+                what: "a container without a vertex, pixel, compute or mesh program",
+            })
+    })?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
-    #[cfg(feature = "diagnostics")]
-    mark("range", &mut phases, &mut marks);
-    let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
-    #[cfg(feature = "diagnostics")]
-    mark("resource", &mut phases, &mut marks);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    #[cfg(feature = "diagnostics")]
-    mark("io", &mut phases, &mut marks);
-    let io = io::raise(&p, &native)?;
+    let code = phases.measure("patch_code", || native.patched_code());
+    let (p, st) = phases.measure("range", || {
+        crate::range::build_timed(&code, native.wave64, native.vgprs, &mut range_phases)
+    })?;
+    drop(code);
+    let res = phases.measure("resource", || {
+        resource::track(&p, &native.layout, native.stage, st.as_ref().ok())
+    })?;
+    let io = phases.measure("io", || io::raise(&p, &native))?;
     let st = st?;
+    let out = phases.measure("emit", || emit_with(&c, &native, &p, &st, &io, &res, options));
     #[cfg(feature = "diagnostics")]
-    mark("emit-start", &mut phases, &mut marks);
-    let out = emit_with(&c, &native, &p, &st, &io, &res, options);
-    #[cfg(feature = "diagnostics")]
-    {
-        mark("emit", &mut phases, &mut marks);
-        let phases: String = marks
-            .iter()
-            .map(|(what, us)| format!("{what}={us}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        eprintln!(
-            "shader phases (us): stage={:?} blocks={} {phases}",
-            native.stage,
-            p.blocks.len()
-        );
-    }
+    tracing::debug!(target: "victory_shader::emit",
+        stage = ?native.stage, code_bytes = native.code.len(), vgprs = native.vgprs, blocks = p.blocks.len(),
+        phases = ?phases.samples.as_deref().unwrap_or_default(),
+        range_phases = ?range_phases.samples.as_deref().unwrap_or_default(),
+        "shader phases (name, microseconds, calls)");
     out
 }
 
