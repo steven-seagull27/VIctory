@@ -60,8 +60,8 @@ uint clamped(uint at) {
         cost = g.x * g.y * g.z * 64;
         dest.Store3(at, g);
     } else {
-        // Preserve the group grid while it fits the old one-axis cost
-        // ceiling. Larger records keep the existing one-axis fallback.
+        // The translated mesh group index reads GroupID.x. Dispatch the
+        // full in-budget count along X so each group gets its own index.
         static const uint MESH_GROUPS = 65535u;
         uint3 g = args.Load3(at);
         // Within the axis limits x * y fits in 32 bits. Divide the
@@ -69,6 +69,8 @@ uint clamped(uint at) {
         if (any(g > MESH_GROUPS)
                 || (g.z != 0 && g.x * g.y > MESH_GROUPS / max(g.z, 1u))) {
             g = min(g, uint3(MESH_GROUPS, 1u, 1u));
+        } else {
+            g = uint3(g.x * g.y * g.z, 1u, 1u);
         }
         cost = g.x * g.y * g.z * 128;
         dest.Store3(at, g);
@@ -833,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn mesh_clamp_keeps_group_grid_and_charges_all_axes() {
+    fn mesh_clamp_linearizes_in_budget_grids_and_charges_all_axes() {
         use super::D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
         let mesh = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32;
         let words = [3, 2, 4, 3, 0, 4, 3, 2, 0, 65_535, 1, 1, u32::MAX, 2, 3, 257, 256, 1];
@@ -846,10 +848,10 @@ mod tests {
         assert_eq!(
             (grids, budget),
             (
-                vec![3, 2, 4, 3, 0, 4, 3, 2, 0, 65_535, 1, 1, 65_535, 1, 1, 257, 1, 1],
-                [127; 16].into_iter().chain([0; 2]).collect(),
+                vec![24, 1, 1, 0, 1, 1, 0, 1, 1, 65_535, 1, 1, 65_535, 1, 1, 257, 1, 1],
+                [65_532; 16].into_iter().chain([0; 2]).collect(),
             ),
-            "mesh coordinates, oversized fallback and list budget",
+            "linear group counts, oversized fallback and list budget",
         );
     }
 
