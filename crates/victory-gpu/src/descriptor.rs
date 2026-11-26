@@ -65,6 +65,9 @@ pub(crate) struct Heap {
     written: Option<crate::watch::Tracked>,
 }
 
+pub(crate) use host::fallback_samplers;
+
+/// A title heap's host copy.
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
     // SAFETY: called from descriptor heap methods only.
     unsafe { &*this.cast::<Heap>() }
@@ -306,6 +309,11 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        // Nothing can find the heap by now. The table's lock is taken
+        // inside the heaps' lock (`memory::bind`), never the other way
+        // round, so it is taken here after the heaps' lock is let go.
+        drop(heaps);
+        crate::memory::release(at);
     }
 }
 
@@ -565,11 +573,19 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 }
 
 /// Device method.
+///
+/// A null `desc` writes a null CBV (`Constant(0, 0)`), matching D3D12's
+/// `CreateConstantBufferView` with a null description. Leaving the slot
+/// untouched would keep a stale view active.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => {
+            let address = u64::from(lo) | u64::from(hi) << 32;
+            View::Constant(address, size)
+        }
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -842,6 +858,35 @@ pub(crate) mod tests {
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
     }
 
+    /// A released view heap takes its title memory page table with it, also
+    /// when no heap is made at its address afterwards (else the table, its
+    /// 16.8 MiB mapping and the copies it names live on).
+    #[test]
+    fn a_released_view_heap_drops_its_page_table() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 1000,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let key = h as usize;
+        assert!(heap(h).host().is_some(), "a host heap");
+        let list = host.new_list().unwrap();
+        assert!(crate::memory::bind(&list, key).is_some(), "a page table");
+        assert!(crate::memory::has_table(key));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+        assert!(!crate::memory::has_table(key), "released with its heap");
+    }
+
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();
@@ -900,6 +945,23 @@ pub(crate) mod tests {
         assert_eq!(view(s3), view(s1));
         assert_eq!(view(at(0) + 8), None);
         heap[0] = 0;
+    }
+
+    /// A null CBV description overwrites the slot (D3D12 null CBV), so a
+    /// later read does not see the previous view.
+    #[test]
+    fn null_cbv_clears_a_stale_view() {
+        let null = std::ptr::null();
+        let slots = [0u64; 2 * 4];
+        let a = slots.as_ptr() as u64;
+        create_cbv(null, &[0x1000, 1, 256, 0], a);
+        assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, 256)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
+        create_srv(null, null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Shader(0, None)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
     }
 
     /// A released resource's views go stale; the same view of a new
@@ -969,21 +1031,28 @@ pub(crate) mod tests {
             nodes: 1,
         };
         let mut h = std::ptr::null();
-        assert_eq!(
-            create(
-                desc,
-                Placement {
-                    address,
-                    size: 64 * 32
-                },
-                &mut h
-            ),
-            S_OK
-        );
+        let placement = Placement { address, size: 64 * 32 };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), address);
+        // Remove the placed heap from the registry before its memory can
+        // be reused by another heap.
+        release(h);
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+        release(h);
+
+        #[cfg(windows)]
+        {
+            // Reuse the address without relying on the allocator to give it
+            // to another test. The descriptor write must reach the new heap.
+            assert_eq!(create(desc, placement, &mut h), S_OK);
+            create_srv(std::ptr::null(), std::ptr::null(), std::ptr::null(), address);
+            let reused = heap(h);
+            let queued = reused.pending.lock().unwrap().as_slice() == [0];
+            release(h);
+            assert!(queued, "the descriptor write reached the heap at the reused address");
+        }
     }
 }

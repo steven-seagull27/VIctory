@@ -12,9 +12,9 @@
 //! either.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
-//! groups per dimension and 2^20 per dispatch, one-dimensional mesh
-//! dispatches, the budget) cut legitimate work beyond them; raise them if
-//! the title needs more.
+//! groups per dimension and 2^20 per compute dispatch, 65,535 groups per
+//! mesh dispatch, the budget) cut legitimate work beyond them; raise them
+//! if the title needs more.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -60,9 +60,16 @@ uint clamped(uint at) {
         cost = g.x * g.y * g.z * 64;
         dest.Store3(at, g);
     } else {
-        // Mesh dispatches: the console's are one-dimensional.
+        // Preserve the group grid while it fits the old one-axis cost
+        // ceiling. Larger records keep the existing one-axis fallback.
+        static const uint MESH_GROUPS = 65535u;
         uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        // Within the axis limits x * y fits in 32 bits. Divide the
+        // ceiling by z to check the total without overflowing.
+        if (any(g > MESH_GROUPS)
+                || (g.z != 0 && g.x * g.y > MESH_GROUPS / max(g.z, 1u))) {
+            g = min(g, uint3(MESH_GROUPS, 1u, 1u));
+        }
         cost = g.x * g.y * g.z * 128;
         dest.Store3(at, g);
     }
@@ -766,12 +773,22 @@ mod tests {
         assert!(super::clamp().is_some());
     }
 
-    /// Clamps `records` records of `kind`, filled by repeating `words`,
-    /// `calls` times in one list: each record's first word in the list's
-    /// argument buffer after (zero when it runs empty). The title's copy,
-    /// one record more included, stays as written. `None` without a host
-    /// GPU.
+    /// The first word of each clamped record (zero when it runs empty).
     fn clamped(kind: u32, words: &[u32], records: u32, calls: u32) -> Option<Vec<u32>> {
+        clamped_words(kind, words, records, calls, 1)
+    }
+
+    /// Clamps `records` records of `kind`, filled by repeating `words`,
+    /// `calls` times in one list and reads the first `fields` words of each.
+    /// The title's copy, one record more included, stays as written.
+    /// `None` without a host GPU.
+    fn clamped_words(
+        kind: u32,
+        words: &[u32],
+        records: u32,
+        calls: u32,
+        fields: usize,
+    ) -> Option<Vec<u32>> {
         let host = super::host()?;
         // Words in a record of `kind`.
         let per = match kind {
@@ -804,9 +821,32 @@ mod tests {
             }
             let mut out_data = std::ptr::null_mut();
             out?.Map(0, None, Some(&mut out_data)).unwrap();
-            let first = |i: usize| out_data.cast::<u32>().add(i * per).read_volatile();
-            Some((0..records as usize).map(first).collect())
+            assert!(fields <= per);
+            let indices = (0..records as usize)
+                .flat_map(|record| (0..fields).map(move |field| record * per + field));
+            Some(indices.map(|i| out_data.cast::<u32>().add(i).read_volatile()).collect())
         }
+    }
+
+    #[test]
+    fn mesh_clamp_keeps_group_grid_and_charges_all_axes() {
+        use super::D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+        let mesh = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32;
+        let words = [3, 2, 4, 3, 0, 4, 3, 2, 0, 65_535, 1, 1, u32::MAX, 2, 3, 257, 256, 1];
+        let Some(grids) = clamped_words(mesh, &words, 6, 1, 3) else {
+            return; // no host GPU here
+        };
+        // Each of these grids costs 65,532 mesh groups. The list has
+        // room for 16, so the last two records must run empty.
+        let budget = clamped(mesh, &[127, 172, 3], 18, 1).unwrap();
+        assert_eq!(
+            (grids, budget),
+            (
+                vec![3, 2, 4, 3, 0, 4, 3, 2, 0, 65_535, 1, 1, 65_535, 1, 1, 257, 1, 1],
+                [127; 16].into_iter().chain([0; 2]).collect(),
+            ),
+            "mesh coordinates, oversized fallback and list budget",
+        );
     }
 
     /// Rejected records do not wrap the budget: of 128 garbage draws (2^26
