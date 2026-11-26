@@ -2034,6 +2034,8 @@ const QUAD_STRIP: u32 = 20;
 mod tests {
     use super::*;
 
+    mod packed_lighting;
+
     /// A root signature that indexes the heaps directly needs one of each
     /// kind bound before it is set: our sampler heap stands in for a title
     /// that binds none, which a compute list that only reads views does.
@@ -2766,11 +2768,11 @@ uint ps() : SV_Target { return 1; }
             Slots(heap, step)
         }
 
-        fn make(&self, i: u32, view: &View) {
+        fn make(&self, i: u32, view: &View) -> ID3D12Resource {
             // SAFETY: a live heap.
             let mut at = unsafe { self.0.GetCPUDescriptorHandleForHeapStart() };
             at.ptr += (i * self.1) as usize;
-            assert!(crate::descriptor::host::make_view(view, at).is_some(), "slot {i} made");
+            crate::descriptor::host::make_view(view, at).expect("host resource for the view")
         }
 
         fn gpu(&self, i: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
