@@ -546,6 +546,9 @@ fn compile() -> windows::core::Result<Converter> {
 }
 
 #[cfg(test)]
+mod payload_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
