@@ -176,9 +176,9 @@ fn lower_words(words: &[u32], host_wave_max: u32) -> Result<lower::Lowered, crat
     })
 }
 
-/// [`program`] lowered for a host whose widest wave is `host_wave_max`.
-fn build(host_wave_max: u32) -> HostShader {
-    let lowered = lower_words(&program(), host_wave_max).expect("lower");
+/// A program lowered for a host whose widest wave is `host_wave_max`.
+fn build_words(words: &[u32], host_wave_max: u32) -> HostShader {
+    let lowered = lower_words(words, host_wave_max).expect("lower");
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -210,7 +210,7 @@ fn a_split_wave64_gives_the_consoles_lanes_masks_and_reads() {
         .unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for host_wave_max in [64, 32] {
-        let shader = build(host_wave_max);
+        let shader = build_words(&program(), host_wave_max);
         for (label, warp) in [("hardware", false), ("warp", true)] {
             let Ok(host) = Host::new(warp) else {
                 eprintln!("no SM 6.6 {label} device; skipped");
@@ -276,6 +276,49 @@ fn run_hardware(shader: &HostShader, dwords: u32) -> Option<Vec<u32>> {
         )
         .expect("dispatch");
     Some(out[0].clone())
+}
+
+/// The IR has one block. The scalar result is visible to every lane after
+/// EXEC is restored, even if the wave's lowest executing lane was in its
+/// upper host half.
+#[test]
+fn converged_first_lane_respects_both_exec_words() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut readbacks = 0;
+    for (compare, first) in [
+        (vopc(0xc4, int(64), 0), 0),
+        (vopc(0xc1, int(6), 0), 7),
+        (vopc(0xc1, int(38), 0), 39),
+        (vopc(0xc1, int(62), 0), 63),
+        (vopc(0xc4, int(0), 0), 0),
+    ] {
+        let mut w = vec![sop1(0x03, 5, 0x80)];
+        w.extend(s_load_dwordx4(8, 4));
+        w.push(vop2(0x1A, 1, int(2), 0)); // v1 = id * 4
+        w.extend(vop3(0x365, 3, 193, int(0), 0)); // console lane numbering
+        w.push(vop2(0x25, 5, LITERAL as u16, 0));
+        w.push(100); // v5 = id + 100: an empty EXEC must still return 100
+        w.push(compare);
+        w.push(sop1(0x24, 20, VCC)); // s_and_saveexec_b64 s[20:21], vcc
+        w.push(vop1(0x02, 14, vgpr(5))); // v_readfirstlane_b32 s14, v5
+        w.push(0x88FE_147E); // s_or_b64 exec, exec, s[20:21]
+        w.push(vop1(0x01, 2, 14));
+        w.extend(buffer_store_dword_offen(2, 1, 8, 0));
+        w.push(S_ENDPGM);
+        for width in [32, 64] {
+            let shader = build_words(&w, width);
+            if let Some(out) = run_hardware(&shader, 64) {
+                readbacks += 1;
+                let expected = 100 + first;
+                assert_eq!(out, vec![expected; 64], "width {width}, first lane {first}");
+            }
+        }
+    }
+    if readbacks == 0 {
+        eprintln!("no hardware device ran Wave32 or Wave64; skipped");
+    }
 }
 
 #[test]
