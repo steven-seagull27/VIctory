@@ -67,6 +67,8 @@ pub(crate) struct Lowered {
     /// Whether it declares rasterizer-ordered views.
     #[cfg(test)]
     pub rovs: bool,
+    #[cfg(test)]
+    pub legacy_half_conversion: bool,
     /// Whether the module declares `dx.op.waveGetLaneIndex`.
     #[cfg(test)]
     pub uses_lane_index: bool,
@@ -1410,6 +1412,8 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
             #[cfg(test)]
+            legacy_half_conversion: self.s.m.has_function("dx.op.legacyF32ToF16"),
+            #[cfg(test)]
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
@@ -2221,7 +2225,11 @@ impl<'a> Lower<'a> {
     // shortcut: rounding toward +-infinity, or a mode not known at this
     // point (paths that set it differently join), rounds to nearest even.
     fn narrow16(&mut self, f: V) -> V {
-        let rtz = self.mode16 == Some(3);
+        self.narrow16_bits(f, self.mode16 == Some(3))
+    }
+
+    /// Converts with a fixed rounding direction, independent of the host.
+    fn narrow16_bits(&mut self, f: V, rtz: bool) -> V {
         let c = self.cur;
         let x = self.as_int(f);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -5220,6 +5228,9 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::And, x, m)
             } else if norm && (2..=16).contains(&w) {
                 self.norm_f16(x, w, matches!(numeric, Numeric::Snorm))
+            } else if matches!(numeric, Numeric::Uscaled | Numeric::Sscaled) {
+                let f = self.as_float(x);
+                self.narrow16_bits(f, false)
             } else {
                 let (f, i32t) = (self.as_float(x), self.s.t.i32);
                 self.s
@@ -11134,6 +11145,16 @@ mod tests {
     }
 
     #[test]
+    fn d16_scaled_buffer_load_uses_portable_rounding() {
+        // tbuffer_load_format_d16_x v0, off, s[8:11], 0 format:16_USCALED
+        let shader = lower_valu(&[0xE848_0000, 0x8022_0000]).unwrap();
+        assert!(
+            !shader.legacy_half_conversion,
+            "D16 load uses host-dependent f32tof16"
+        );
+    }
+
+    #[test]
     fn the_24_bit_multiplies_lower_both_halves() {
         // VOP2 `op v0, v1, v2`: v_mul_i32_i24 and v_mul_u32_u24 (the low
         // dword) and v_mul_hi_i32_i24 and v_mul_hi_u32_u24 (the high one).
@@ -11593,6 +11614,7 @@ mod tests {
         let layout = vec![root(RootType::Table, 0, 0)];
         let l = lower_with(&words, layout, used).unwrap();
         assert_eq!(l.nonuniform_handles, 0);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -11646,6 +11668,7 @@ mod tests {
         let l = lower_with(&words, layout, used).unwrap();
         // One image handle from the joins' heap index, the same in all lanes.
         assert_eq!(l.nonuniform_handles, 0);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -11696,6 +11719,7 @@ mod tests {
         // One image handle made in the entry block for both loads, and the
         // UAV's.
         assert_eq!(l.heap_handles, 2);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
