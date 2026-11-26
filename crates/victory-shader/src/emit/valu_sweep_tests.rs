@@ -321,7 +321,7 @@ fn sweep_typed_buffer_formats() {
         let refs: Vec<Vec<Exact>> = cases.iter().map(|&c| channels(bits, num, c)).collect();
         let shader = format_shader(n, false);
         for (backend, values) in format_rows(&shader, &cases) {
-            for (i, row) in values.chunks_exact(4).enumerate() {
+            for (i, row) in values.as_chunks::<4>().0.iter().enumerate() {
                 for (ch, &got) in row.iter().enumerate() {
                     checked += 1;
                     let wants = want32(&refs[i][ch]);
@@ -344,7 +344,7 @@ fn sweep_typed_buffer_formats() {
         }
         let shader = format_shader(n, true);
         for (backend, values) in format_rows(&shader, &cases) {
-            for (i, row) in values.chunks_exact(4).enumerate() {
+            for (i, row) in values.as_chunks::<4>().0.iter().enumerate() {
                 checked += 2; // two packed dwords per row
                 for ch in 0..4 {
                     let g = (row[ch / 2] >> (16 * (ch % 2))) as u16;
