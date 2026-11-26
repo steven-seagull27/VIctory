@@ -616,9 +616,8 @@ impl<'a> Lower<'a> {
             // of more than one row, four threads of one row. Hosts place
             // two-dimensional groups their own way (a run on an RX 6750 XT
             // put 2x2 tiles of threads in a quad), so such a program runs
-            // as one row, where every host keeps the order.
-            if !console_lanes
-                && cs.threads[1] * cs.threads[2] > 1
+            // as one row so each quad covers consecutive flat thread IDs.
+            if cs.threads[1] * cs.threads[2] > 1
                 && insts().any(|i| quads::implicit_level(i.name()))
             {
                 rows = Some(cs.threads);
@@ -2934,13 +2933,15 @@ impl<'a> Lower<'a> {
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
-        if let Some(rows) = self.rows {
-            return self.row_thread_id(rows, c);
-        }
         if !self.console_lanes {
+            if let Some(rows) = self.rows {
+                return self.row_thread_id(rows, c);
+            }
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
-        let [x, y, _] = self.s.threads.expect("compute");
+        // The hardware wave runs in the flattened host group. Convert its
+        // logical flat ID back to coordinates using the guest dimensions.
+        let [x, y, _] = self.rows.or(self.s.threads).expect("compute");
         let e = self.s.entry;
         let i32t = self.s.t.i32;
         let flat = self.s.op(
