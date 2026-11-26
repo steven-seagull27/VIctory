@@ -592,7 +592,10 @@ impl Staging {
                 return (0, None);
             }
             let ranges = t.take(start, start + size);
-            if ranges.is_empty() {
+            // Parts on pages that are not the runtime's are not tracked: read
+            // at each refresh, their bytes decide (`watch::Tracked::untracked`).
+            let loose = t.untracked(start, start + size);
+            if ranges.is_empty() && loose.is_empty() {
                 return (0, None);
             }
             // Only the subresources in the pages that changed (streamed
@@ -603,7 +606,8 @@ impl Staging {
             let touched: Vec<usize> = (0..n)
                 .filter(|&i| {
                     let (a, b) = span(i);
-                    ranges.iter().any(|&(f, e)| f - start < b && a < e - start)
+                    let mut changed = ranges.iter().chain(&loose);
+                    changed.any(|&(f, e)| f - start < b && a < e - start)
                 })
                 .collect();
             // A changed page that holds only the subresource's bytes says it

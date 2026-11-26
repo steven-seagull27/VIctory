@@ -3202,6 +3202,46 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// A mip in memory that is not the runtime's (plain committed memory
+    /// after a page with nothing mapped) is not tracked: read at each use,
+    /// as a buffer copy's bytes there are, it is uploaded at first and again
+    /// once it changes.
+    #[test]
+    fn a_mip_off_the_runtimes_memory_is_uploaded() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::*;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        // SAFETY: a fresh reservation of two pages, the second committed;
+        // kept (as the other tests' pools).
+        let p = unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            let second = VirtualAlloc((p + PAGE) as _, PAGE, MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert!(p != 0 && second == p + PAGE);
+            p
+        };
+        // RGBA8 128x128 with two mips, linear: mip 1 (16 KiB) first, in the
+        // reserved page; mip 0 (64 KiB) after it, the committed page whole.
+        let address = (p + PAGE - (16 << 10)) as u64;
+        let mut words = texture_words(128, 128, 28, 0x100, 0);
+        words[7] = 1 | 2 << 16;
+        let object = texture_at_address(address, &words);
+        let view = View::Shader(object as usize, Some([28, 4, 0x1688, 0, 0, 2, 0, 0, 0, 0]));
+        let submit = || {
+            let list = host.new_list().unwrap();
+            readable(&list, &used(ResourceType::Srv), &view, false);
+            list.close();
+            let before = crate::texture::copied(object);
+            host.execute(&[&list]);
+            crate::texture::copied(object) - before
+        };
+        assert_eq!(submit(), 2, "both mips at first");
+        // SAFETY: mip 0's bytes, the plain page.
+        unsafe { std::ptr::write_bytes((address + (16 << 10)) as *mut u8, 0x80, PAGE) };
+        assert_eq!(submit(), 1, "mip 0 again once it changed");
+    }
+
     /// A depth texture with stencil (the console's 16-bit depth, the
     /// host's 32-bit float) written through unordered views of its planes,
     /// then read as depth and stencil: the 16-bit depth arrives as the
