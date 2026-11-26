@@ -2951,6 +2951,67 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn texture_copy_list() -> (This, This, This) {
+        let null = std::ptr::null();
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(
+                null,
+                queue_desc.as_ptr().cast(),
+                &guid(
+                    0x0ec870a6,
+                    0x5d7e,
+                    0x4c22,
+                    [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]
+                ),
+                &mut queue
+            ),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(
+                null,
+                0,
+                &guid(
+                    0x6102dee4,
+                    0xaf59,
+                    0x4b09,
+                    [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]
+                ),
+                &mut allocator
+            ),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(
+                null,
+                0,
+                0,
+                allocator,
+                null,
+                &guid(
+                    0x5b160d0f,
+                    0xac1b,
+                    0x4185,
+                    [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]
+                ),
+                &mut list
+            ),
+            S_OK
+        );
+        (queue, allocator, list)
+    }
+
+    #[cfg(windows)]
+    #[repr(C)]
+    struct TextureLocation {
+        resource: This,
+        kind: u32,
+        footprint: PlacedFootprint,
+    }
+
     /// A texture region copied into a title buffer through our list and
     /// queue: once the list has run, its rows are in the buffer at the
     /// footprint's offset and pitch, and nothing else of the buffer moved.
@@ -3003,59 +3064,7 @@ mod tests {
             let (out, _) = buffer_bytes(target).unwrap();
             // SAFETY: the buffer holds 4096 bytes.
             unsafe { std::ptr::write_bytes(out, 0xEE, 4096) };
-            let (mut queue, mut allocator, mut list) = (null, null, null);
-            let queue_desc = [0u32; 4];
-            assert_eq!(
-                crate::queue::create(
-                    null,
-                    queue_desc.as_ptr().cast(),
-                    &guid(
-                        0x0ec870a6,
-                        0x5d7e,
-                        0x4c22,
-                        [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]
-                    ),
-                    &mut queue
-                ),
-                S_OK
-            );
-            assert_eq!(
-                crate::list::create_allocator(
-                    null,
-                    0,
-                    &guid(
-                        0x6102dee4,
-                        0xaf59,
-                        0x4b09,
-                        [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]
-                    ),
-                    &mut allocator
-                ),
-                S_OK
-            );
-            assert_eq!(
-                crate::list::create_list(
-                    null,
-                    0,
-                    0,
-                    allocator,
-                    null,
-                    &guid(
-                        0x5b160d0f,
-                        0xac1b,
-                        0x4185,
-                        [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]
-                    ),
-                    &mut list
-                ),
-                S_OK
-            );
-            #[repr(C)]
-            struct Location {
-                resource: This,
-                kind: u32,
-                footprint: PlacedFootprint,
-            }
+            let (queue, allocator, list) = texture_copy_list();
             let rows = PlacedFootprint {
                 offset: 0,
                 format,
@@ -3064,17 +3073,17 @@ mod tests {
                 depth: 1,
                 row_pitch: 256,
             };
-            let image_at = Location {
+            let image_at = TextureLocation {
                 resource: image,
                 kind: 0,
                 footprint: rows,
             };
-            let from_source = Location {
+            let from_source = TextureLocation {
                 resource: source,
                 kind: 1,
                 footprint: rows,
             };
-            let into_target = Location {
+            let into_target = TextureLocation {
                 resource: target,
                 kind: 1,
                 footprint: PlacedFootprint {
@@ -3083,7 +3092,7 @@ mod tests {
                 },
             };
             type Copy =
-                extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+                extern "system" fn(This, *const TextureLocation, u32, u32, u32, *const TextureLocation, *const u8);
             let copy = slot::<Copy>(list, 0x80);
             copy(list, &image_at, 0, 0, 0, &from_source, null.cast());
             let mut want = vec![0xEEu8; 4096];
@@ -3130,6 +3139,9 @@ mod tests {
             "(format, untouched buffer): {failures:?}"
         );
     }
+
+    #[cfg(windows)]
+    mod depth_readback_tests;
 
     /// Two queues, as Grand Theft Auto VI's: a compute list copies a buffer,
     /// then waits for a value a graphics list writes at its end, then reads
