@@ -8,6 +8,7 @@
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
+use crate::ShaderError;
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -2615,4 +2616,246 @@ fn gathers_of_a_1d_3d_or_offset_cube_image_are_refused() {
         let err = sample_cs(&body(op, dim)).expect_err(what);
         assert!(err.contains("gather"), "{what}: {err}");
     }
+}
+
+#[test]
+fn image_gather4_c_lz_and_offset_match_rdna2() {
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    // SMEM s_load_dwordx{4,8} s[dst..], s[base:base+1], offset (soffset = null).
+    let s_load = |op: u32, dst: u8, base: u8, offset: u32| -> [u32; 2] {
+        [
+            0x3D << 26 | op << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+            125 << 25 | (offset & 0x1F_FFFF),
+        ]
+    };
+    // MIMG: unorm=0, a16=0, d16=0.
+    let mimg =
+        |op: u32, dim: u8, dmask: u8, vdata: u8, vaddr: u8, srsrc: u8, ssamp: u8| -> [u32; 2] {
+            [
+                0x3C << 26
+                    | (op & 0x7F) << 18
+                    | (dmask as u32) << 8
+                    | ((dim as u32 & 7) << 3)
+                    | (op >> 7 & 1),
+                ((ssamp as u32 >> 2) & 0x1F) << 21
+                    | ((srsrc as u32 >> 2) & 0x1F) << 16
+                    | (vdata as u32) << 8
+                    | vaddr as u32,
+            ]
+        };
+    let lower_gather_cs =
+        |gather_inst: [u32; 2], addr_regs: &[u8]| -> Result<HostShader, ShaderError> {
+            let mut words = vec![
+                s_mov_b32(5, 0x80), // s5 = 0 (high dword of view table)
+                s_mov_b32(7, 0x80), // s7 = 0 (high dword of sampler table)
+            ];
+            words.extend_from_slice(&s_load(0x03, 16, 4, 0)); // s[16:23] = SRV (entry 0)
+            words.extend_from_slice(&s_load(0x02, 8, 4, 32)); // s[8:11] = raw UAV (entry 1)
+            words.extend_from_slice(&s_load(0x02, 12, 6, 0)); // s[12:15] = cmp sampler (entry 0)
+            for (idx, &src_s) in addr_regs.iter().enumerate() {
+                words.push(vop1(0x001, idx as u8, sgpr(src_s)));
+            }
+            words.extend_from_slice(&gather_inst);
+            for k in 0..4u8 {
+                words.extend_from_slice(&buffer_store_dword(4 + k, 8, u16::from(k) * 4));
+            }
+            words.push(S_ENDPGM);
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 12,
+                layout: vec![
+                    RootParam {
+                        root: RootType::Constants,
+                        table_offset_dwords: 0,
+                        sgprs: 4,
+                        base_register: 0,
+                        user_data: 0,
+                        slot: 0,
+                    },
+                    RootParam {
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        sgprs: 1,
+                        base_register: 0,
+                        user_data: 4,
+                        slot: 1,
+                    },
+                    RootParam {
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        sgprs: 1,
+                        base_register: 0,
+                        user_data: 6,
+                        slot: 2,
+                    },
+                ],
+                used: vec![
+                    UsedResource {
+                        kind: ResourceType::Srv,
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        lower_bound: 0,
+                        stride: 0,
+                        dwords: 8,
+                        user_data: 4,
+                        slot: 1,
+                    },
+                    UsedResource {
+                        kind: ResourceType::Uav,
+                        root: RootType::Table,
+                        table_offset_dwords: 8,
+                        lower_bound: 0,
+                        stride: 0,
+                        dwords: 4,
+                        user_data: 4,
+                        slot: 1,
+                    },
+                    UsedResource {
+                        kind: ResourceType::Sampler,
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        lower_bound: 0,
+                        stride: 0,
+                        dwords: 4,
+                        user_data: 6,
+                        slot: 2,
+                    },
+                ],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 7 << 1, // 7 user SGPRs: s0..s6
+                    threads: [1, 1, 1],
+                }),
+                code,
+            };
+            lower_valu_cs(&native)
+        };
+
+    // image_gather4_c_lz (0x4f) on 2D (dim=1): v[0]=ref, v[1]=u, v[2]=v -> v[4..8]
+    let gather_r = lower_gather_cs(mimg(0x4F, 1, 0x1, 4, 0, 16, 12), &[0, 1, 2]).expect("gather_r");
+    // image_gather4_c_lz_o (0x5f) on 2D (dim=1): v[0]=offsets, v[1]=ref, v[2]=u, v[3]=v -> v[4..8]
+    let gather_o =
+        lower_gather_cs(mimg(0x5F, 1, 0x1, 4, 0, 16, 12), &[0, 1, 2, 3]).expect("gather_o");
+    // image_gather4_c_lz on Cube (dim=3): v[0]=ref, v[1]=s, v[2]=t, v[3]=face -> DXIL validates.
+    let _gather_cube =
+        lower_gather_cs(mimg(0x4F, 3, 0x1, 4, 0, 16, 12), &[0, 1, 2, 3]).expect("gather_cube");
+    // Unsupported forms must reject cleanly rather than miscompiling.
+    for dmask in [2, 4, 8] {
+        for (opcode, regs) in [(0x4f, &[0, 1, 2][..]), (0x5f, &[0, 1, 2, 3][..])] {
+            assert!(matches!(
+                lower_gather_cs(mimg(opcode, 1, dmask, 4, 0, 16, 12), regs),
+                Err(ShaderError::Unsupported {
+                    what: "a comparison gather of a non-red channel",
+                    ..
+                })
+            ));
+        }
+    }
+    assert!(
+        matches!(
+            lower_gather_cs(mimg(0x5F, 3, 0x1, 4, 0, 16, 12), &[0, 1, 2, 3, 0]),
+            Err(ShaderError::Unsupported {
+                what: "a cube gather with texel offsets",
+                ..
+            })
+        ),
+        "cube gather with texel offsets must be rejected",
+    );
+    assert!(
+        matches!(
+            lower_gather_cs(mimg(0x4F, 0, 0x1, 4, 0, 16, 12), &[0, 1]),
+            Err(ShaderError::Unsupported {
+                what: "a gather of a 1D or 3D image",
+                ..
+            })
+        ),
+        "1D comparison gather must be rejected",
+    );
+
+    // Comparison gather is supported on R32_FLOAT. Each depth is its texel index.
+    let depths: [f32; 16] = std::array::from_fn(|i| i as f32);
+    let cmp_sampler = [D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_LESS,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    }];
+    let views = [View::Depth(4, 4, &depths), View::RawUav(4)];
+
+    fn run_gather(
+        shader: &HostShader,
+        views: &[View],
+        samplers: &[D3D12_SAMPLER_DESC],
+        cases: &[([u32; 4], [f32; 4])],
+    ) {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let (root, pso) = host.compute_pipeline(shader).expect("compute_pipeline");
+            for &(c, want) in cases {
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            groups: [1, 1, 1],
+                            roots: vec![(
+                                0,
+                                Root::Constants(vec![c[0], c[1], c[2], c[3], 0, 0, 0]),
+                            )],
+                            views,
+                            samplers,
+                        },
+                    )
+                    .expect("dispatch");
+                let got = [
+                    f32::from_bits(out[0][0]),
+                    f32::from_bits(out[0][1]),
+                    f32::from_bits(out[0][2]),
+                    f32::from_bits(out[0][3]),
+                ];
+                assert_eq!(got, want, "{label}: constants={c:#010x?}");
+            }
+            ran += 1;
+        }
+        assert!(ran > 0, "neither hardware nor WARP host ran");
+    }
+
+    let f = f32::to_bits;
+    let half = f(0.5);
+    // At (0.5, 0.5): R footprint is (1,2)=9, (2,2)=10, (2,1)=6, (1,1)=5.
+    run_gather(
+        &gather_r,
+        &views,
+        &cmp_sampler,
+        &[
+            ([f(7.5), half, half, 0], [1.0, 1.0, 0.0, 0.0]),
+            ([f(5.5), half, half, 0], [1.0, 1.0, 1.0, 0.0]),
+            ([f(9.5), half, half, 0], [0.0, 1.0, 0.0, 0.0]),
+        ],
+    );
+    let pack_off = |ox: i32, oy: i32| ((ox & 0x3F) as u32) | (((oy & 0x3F) as u32) << 8);
+    // Offset (-1, +1) -> footprint (0,3)=12, (1,3)=13, (1,2)=9, (0,2)=8.
+    let off_m1_p1 = pack_off(-1, 1);
+    // Offset (+1, -1) -> footprint (2,1)=6, (3,1)=7, (3,0)=3, (2,0)=2.
+    let off_p1_m1 = pack_off(1, -1);
+    run_gather(
+        &gather_o,
+        &views,
+        &cmp_sampler,
+        &[
+            ([off_m1_p1, f(10.5), half, half], [1.0, 1.0, 0.0, 0.0]),
+            ([off_m1_p1, f(8.5), half, half], [1.0, 1.0, 1.0, 0.0]),
+            ([off_p1_m1, f(4.5), half, half], [1.0, 1.0, 0.0, 0.0]),
+        ],
+    );
 }

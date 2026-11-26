@@ -8979,6 +8979,10 @@ impl<'a> Lower<'a> {
                     if dmask.count_ones() != 1 {
                         return Err("a gather of several channels");
                     }
+                    if op == 74 && *dmask != 1 {
+                        // The comparison gather reads the red depth component.
+                        return Err("a comparison gather of a non-red channel");
+                    }
                     if offset_word {
                         let w = addr_val(self, 0)?;
                         for (k, at) in [(0, 26), (1, 18)] {
