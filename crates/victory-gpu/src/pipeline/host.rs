@@ -937,6 +937,7 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum ColorStream {
         Unorm,
+        FlatAndSmooth { first: usize, reversed: bool },
         FloatFirst,
         Constant,
     }
@@ -947,6 +948,15 @@ mod tests {
     fn cpu_rectangle_uses_the_position_corner_order_for_split_vertex_streams() {
         for color in [ColorStream::Unorm, ColorStream::FloatFirst, ColorStream::Constant] {
             check_split_rectangle(color);
+        }
+    }
+
+    #[test]
+    fn split_rectangle_keeps_the_leading_color_on_both_triangles() {
+        for first in 0..3 {
+            for reversed in [false, true] {
+                check_split_rectangle(ColorStream::FlatAndSmooth { first, reversed });
+            }
         }
     }
 
@@ -963,14 +973,20 @@ mod tests {
             return;
         };
         let source = b"
-struct Vertex { float4 position : SV_Position; float4 color : COLOR; };
+struct Vertex {
+    float4 position : SV_Position;
+    float4 color : COLOR0;
+    nointerpolation float2 leading : COLOR1;
+};
 Vertex vs(float2 position : POSITION, float4 color : COLOR) {
     Vertex output;
     output.position = float4(position, 0.5, 1);
     output.color = color;
+    output.leading = color.rg;
     return output;
 }
 float4 ps(Vertex input) : SV_Target { return input.color; }
+float4 ps_both(Vertex input) : SV_Target { return float4(input.color.rg, input.leading); }
 ";
         let compile = |stage, kind, entry, target| {
             let mut code: Option<ID3DBlob> = None;
@@ -1026,9 +1042,14 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
             );
             Arc::new(shader)
         };
+        let pixel = if matches!(layout, ColorStream::FlatAndSmooth { .. }) {
+            s!("ps_both")
+        } else {
+            s!("ps")
+        };
         let shaders = vec![
             compile("vertex", HwStage::Vs, s!("vs"), s!("vs_5_1")),
-            compile("pixel", HwStage::Ps, s!("ps"), s!("ps_5_1")),
+            compile("pixel", HwStage::Ps, pixel, s!("ps_5_1")),
         ];
         let format = DXGI_FORMAT_R32G32B32A32_FLOAT;
         let mut graphics = Box::new(GraphicsState::default());
@@ -1071,14 +1092,19 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
         let position = crate::resource::test_buffer(256);
         let color = crate::resource::test_buffer(256);
         let address = |buffer| crate::resource::buffer_bytes(buffer).unwrap().0;
+        let mut order = [0, 1, 2];
+        if let ColorStream::FlatAndSmooth { first, reversed } = layout {
+            order.rotate_left(first);
+            if reversed {
+                order.swap(1, 2);
+            }
+        }
+        let positions = [[-1.0, 1.0], [-1.0, -1.0], [1.0, 1.0]];
+        let colors = [[0, 0, 0, 255], [0, 255, 0, 255], [255, 0, 0, 255]];
         // SAFETY: each allocation holds four test vertices.
         unsafe {
-            address(position).cast::<[[f32; 2]; 4]>().write_unaligned([
-                [0.0, 0.0],
-                [-1.0, 1.0],
-                [-1.0, -1.0],
-                [1.0, 1.0],
-            ]);
+            let [a, b, c] = order.map(|i| positions[i]);
+            address(position).cast::<[[f32; 2]; 4]>().write_unaligned([[0.0; 2], a, b, c]);
             match layout {
                 ColorStream::FloatFirst => {
                     address(color).cast::<[[f32; 2]; 4]>().write_unaligned([
@@ -1088,13 +1114,9 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
                         [0.0, 1.0],
                     ]);
                 }
-                ColorStream::Unorm => {
-                    address(color).cast::<[[u8; 4]; 4]>().write_unaligned([
-                        [0; 4],
-                        [0, 0, 0, 255],
-                        [0, 255, 0, 255],
-                        [255, 0, 0, 255],
-                    ]);
+                ColorStream::Unorm | ColorStream::FlatAndSmooth { .. } => {
+                    let [a, b, c] = order.map(|i| colors[i]);
+                    address(color).cast::<[[u8; 4]; 4]>().write_unaligned([[0; 4], a, b, c]);
                 }
                 ColorStream::Constant => {
                     address(color).cast::<[u8; 4]>().write_unaligned([255, 0, 0, 255]);
@@ -1130,7 +1152,7 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
             stride: u32,
         }
         let (color_size, color_stride) = match layout {
-            ColorStream::Unorm => (16, 4),
+            ColorStream::Unorm | ColorStream::FlatAndSmooth { .. } => (16, 4),
             ColorStream::FloatFirst => (32, 8),
             ColorStream::Constant => (4, 0),
         };
@@ -1263,16 +1285,24 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
             // SAFETY: the texture copy finished and this texel is within the mapped buffer.
             unsafe { data.add(offset).cast::<[f32; 4]>().read_unaligned() }
         };
-        let actual = [texel(0, 0), texel(1, 1)];
+        let actual = [texel(0, 0), texel(1, 0), texel(0, 1), texel(1, 1)];
         for o in [guest, allocator, pipeline, position, color] {
             assert_eq!(slot::<extern "system" fn(This) -> u32>(o, 0x10)(o), 0);
         }
-        let expected = match layout {
-            ColorStream::Unorm => [[0.25, 0.25, 0.0, 1.0], [0.75, 0.75, 0.0, 1.0]],
-            ColorStream::FloatFirst => [[0.25, 0.5, 0.0, 1.0], [0.75, 1.5, 0.0, 1.0]],
-            ColorStream::Constant => [[1.0, 0.0, 0.0, 1.0]; 2],
-        };
-        assert_eq!(actual, expected, "{layout:?}");
+        for (i, got) in actual.into_iter().enumerate() {
+            let x = if i % 2 == 0 { 0.25 } else { 0.75 };
+            let y = if i < 2 { 0.25 } else { 0.75 };
+            let expected = match layout {
+                ColorStream::Unorm => [x, y, 0.0, 1.0],
+                ColorStream::FloatFirst => [y, x + y, 0.0, 1.0],
+                ColorStream::Constant => [1.0, 0.0, 0.0, 1.0],
+                ColorStream::FlatAndSmooth { first, .. } => {
+                    let [r, g, ..] = colors[first];
+                    [x, y, f32::from(r) / 255.0, f32::from(g) / 255.0]
+                }
+            };
+            assert_eq!(got, expected, "{layout:?} texel {i}");
+        }
     }
 
     fn targets(formats: &[DXGI_FORMAT]) -> D3D12_RT_FORMAT_ARRAY {
