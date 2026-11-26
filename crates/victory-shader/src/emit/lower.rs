@@ -14,7 +14,7 @@ use super::container::SigElement;
 use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
+use crate::io::{Attribute, Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
 use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
@@ -29,6 +29,12 @@ enum Val {
     I32(V),
     Bit(V),
     Missing(Why),
+}
+
+enum InterpChannels {
+    Full((u8, u8)),
+    Half((u8, u8)),
+    Packed([Option<(u8, u8)>; 2]),
 }
 
 pub(crate) struct Lowered {
@@ -214,6 +220,8 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
+    /// Inputs declared at center that are also evaluated at centroid.
+    centroid_inputs: HashSet<usize>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
     /// Handles made in the entry block for descriptors at addresses the
     /// root parameters alone give (table and heap loads with no other
@@ -680,6 +688,7 @@ impl<'a> Lower<'a> {
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
+            centroid_inputs: HashSet::new(),
             handles: HashMap::new(),
             entry_handles: HashMap::new(),
             join_handles: HashMap::new(),
@@ -1319,6 +1328,7 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.find_sections();
+        self.plan_interp_modes();
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
@@ -8063,11 +8073,52 @@ impl<'a> Lower<'a> {
         }
     }
 
-    fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
+    fn plan_interp_modes(&mut self) {
+        if self.interps.is_empty() {
+            return;
+        }
+        let mut modes = vec![0u8; self.s.inputs.len()];
+        for &(site @ (b, i), _) in &self.x.io.interps {
+            if self.block[b].is_none()
+                || self.sections.get(&b).is_some_and(|sections| {
+                    sections.iter().any(|(&start, s)| start < i && i < s.end)
+                })
+            {
+                continue;
+            }
+            let Ok((attribute, mode)) = self.interp_mode(site) else {
+                continue;
+            };
+            let channels = match self.interp_channels(&self.x.p.blocks[b].insts[i], attribute, mode)
+            {
+                Ok(InterpChannels::Full(ch) | InterpChannels::Half(ch)) => [Some(ch), None],
+                Ok(InterpChannels::Packed(channels)) => channels,
+                Err(_) => continue,
+            };
+            for (row, ch) in channels.into_iter().flatten() {
+                if let Some((id, _)) = self.find_input(row, ch) {
+                    modes[id] |= 1 << mode;
+                }
+            }
+        }
+        // Declare a mixed input at center before emitting any of its reads.
+        for (id, (e, modes)) in self.s.inputs.iter_mut().zip(modes).enumerate() {
+            if e.comp == 9 {
+                e.interp = match modes {
+                    m if m == (1 << 2 | 1 << 3) => 2,
+                    m if m == (1 << 4 | 1 << 5) => 4,
+                    _ => continue,
+                };
+                self.centroid_inputs.insert(id);
+            }
+        }
+    }
+
+    fn interp_mode(&self, site: Site) -> Result<(Attribute, u8), Why> {
         let Some(&interp) = self.interps.get(&site) else {
             return Err("the first half of an interpolation");
         };
-        let (attribute, mode) = match interp {
+        Ok(match interp {
             Interp::Interpolated { unless, .. } if !self.avoids(site, unless) => {
                 return Err("an interpolation with computed barycentrics");
             }
@@ -8076,7 +8127,7 @@ impl<'a> Lower<'a> {
                 barycentric,
                 ..
             } => (
-                attribute,
+                *attribute,
                 match barycentric {
                     Barycentric::PerspectiveCenter => 2,
                     Barycentric::PerspectiveCentroid => 3,
@@ -8091,9 +8142,53 @@ impl<'a> Lower<'a> {
             Interp::Vertex {
                 attribute,
                 vertex: 2,
-            } => (attribute, 1),
+            } => (*attribute, 1),
             Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
+        })
+    }
+
+    fn interp_channels(
+        &self,
+        inst: &Inst,
+        attribute: Attribute,
+        mode: u8,
+    ) -> Result<InterpChannels, Why> {
+        let packing = match &self.x.native.io {
+            StageIo::Ps { inputs, .. } => inputs
+                .iter()
+                .find(|i| i.row == attribute.row && i.fp16)
+                .map(|i| i.pack2),
+            _ => None,
         };
+        let f16 = inst.name().ends_with("_f16");
+        let Some(pack2) = packing else {
+            if f16 || attribute.high {
+                return Err("a 16-bit read of a 32-bit input");
+            }
+            return Ok(InterpChannels::Full((attribute.row, attribute.channel)));
+        };
+        // 16-bit values: one in the low half of each dword, or two per dword.
+        let half = |h: u8| {
+            if pack2 {
+                packed_half(&self.s.inputs, attribute.row, h)
+            } else {
+                h.is_multiple_of(2).then_some((attribute.row, h / 2))
+            }
+        };
+        let h = 2 * attribute.channel;
+        if f16 {
+            half(h + u8::from(attribute.high))
+                .map(InterpChannels::Half)
+                .ok_or("a packed input half no element holds")
+        } else if mode == 1 {
+            Ok(InterpChannels::Packed([half(h), half(h + 1)]))
+        } else {
+            Err("32-bit interpolation of a 16-bit input")
+        }
+    }
+
+    fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
+        let (attribute, mode) = self.interp_mode(site)?;
         let dst = match &inst.fields {
             Fields::Vintrp { dst, .. } => *dst,
             Fields::Valu(v) => v.dst.ok_or("an interpolation")?,
@@ -8103,67 +8198,60 @@ impl<'a> Lower<'a> {
             return Err("an interpolation");
         };
         // A channel of an input element, interpolated as `mode` says.
-        let channel = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
+        let channel = |l: &mut Self, (row, ch)| -> Result<V, Why> {
             let (id, col) = l
                 .find_input(row, ch)
                 .ok_or("an input the signature lacks")?;
             let e = &mut l.s.inputs[id];
-            if e.interp != mode && e.usage != 0 {
-                return Err("one input interpolated two ways");
+            if e.interp != mode {
+                let at_centroid = l.centroid_inputs.contains(&id);
+                if at_centroid && matches!((e.interp, mode), (2, 3) | (4, 5)) {
+                    e.usage |= 1 << col;
+                    let entry = l.s.entry;
+                    let args = [l.s.m.i32(id as u32), l.s.m.i32(0), l.s.m.i8(col)];
+                    let v = l.s.op(
+                        entry,
+                        "evalCentroid.f32",
+                        Attr::ReadNone,
+                        l.s.t.f32,
+                        89,
+                        &args,
+                    );
+                    return Ok(l.s.m.cast(entry, Cast::Bitcast, v, l.s.t.i32));
+                }
+                if e.usage != 0 || at_centroid {
+                    return Err("one input interpolated two ways");
+                }
+                e.interp = mode;
             }
-            e.interp = mode;
             match l.load_any_input(id, col) {
                 Val::I32(x) => Ok(x),
                 _ => Err("an input"),
             }
         };
-        let packing = match &self.x.native.io {
-            StageIo::Ps { inputs, .. } => inputs
-                .iter()
-                .find(|i| i.row == attribute.row && i.fp16)
-                .map(|i| i.pack2),
-            _ => None,
+        let half = |l: &mut Self, ch| -> Result<V, Why> {
+            let x = channel(l, ch)?;
+            let f = l.as_float(x);
+            Ok(l.narrow16(f))
         };
-        let f16 = inst.name().ends_with("_f16");
-        let x = match packing {
-            None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
-            None => channel(self, attribute.row, attribute.channel)?,
-            Some(pack2) => {
-                // 16-bit values: one in the low half of each dword, or two
-                // per dword (`packed_half`); the host's are 32-bit floats.
-                let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
-                    let src = if pack2 {
-                        packed_half(&l.s.inputs, attribute.row, h)
-                    } else {
-                        h.is_multiple_of(2).then_some((attribute.row, h / 2))
-                    };
-                    let Some((row, ch)) = src else {
-                        return Ok(None);
-                    };
-                    let x = channel(l, row, ch)?;
-                    let f = l.as_float(x);
-                    Ok(Some(l.narrow16(f)))
-                };
-                let h = 2 * attribute.channel;
+        let x = match self.interp_channels(inst, attribute, mode)? {
+            InterpChannels::Full(ch) => channel(self, ch)?,
+            InterpChannels::Half(ch) => {
+                let lo = half(self, ch)?;
+                // omod and clamp are part of the f16 instruction; op_sel[3]
+                // picks the destination half.
+                let lo = self.half_modifiers(inst, lo);
+                return self.write_half(inst, lo, None);
+            }
+            InterpChannels::Packed([lo, hi]) => {
+                // The whole dword of a flat input: both halves.
                 let c = self.cur;
-                if f16 {
-                    let lo = half(self, h + u8::from(attribute.high))?
-                        .ok_or("a packed input half no element holds")?;
-                    // omod and clamp are part of the f16 instruction; op_sel[3]
-                    // picks the destination half.
-                    let lo = self.half_modifiers(inst, lo);
-                    return self.write_half(inst, lo, None);
-                } else if mode == 1 {
-                    // The whole dword of a flat input: both halves.
-                    let z = self.s.m.i32(0);
-                    let lo = half(self, h)?.unwrap_or(z);
-                    let hi = half(self, h + 1)?.unwrap_or(z);
-                    let k16 = self.s.m.i32(16);
-                    let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                    self.s.m.bin(c, Bin::Or, lo, hi)
-                } else {
-                    return Err("32-bit interpolation of a 16-bit input");
-                }
+                let z = self.s.m.i32(0);
+                let lo = lo.map(|ch| half(self, ch)).transpose()?.unwrap_or(z);
+                let hi = hi.map(|ch| half(self, ch)).transpose()?.unwrap_or(z);
+                let k16 = self.s.m.i32(16);
+                let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                self.s.m.bin(c, Bin::Or, lo, hi)
             }
         };
         // A pixel interpolates in every lane; guards only hide inactive ones.

@@ -1630,20 +1630,134 @@ mod tests {
         if !dxc.exists() {
             return None;
         }
-        let file = std::env::temp_dir().join(format!("victory-interp-{}.dxil", std::process::id()));
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT_DUMP: AtomicUsize = AtomicUsize::new(0);
+        let file = std::env::temp_dir().join(format!(
+            "victory-interp-{}-{}.dxil",
+            std::process::id(),
+            NEXT_DUMP.fetch_add(1, Ordering::Relaxed),
+        ));
         std::fs::write(&file, container).ok()?;
         let out = std::process::Command::new(dxc)
             .arg("-dumpbin")
             .arg(&file)
-            .output()
-            .ok()?;
+            .output();
         let _ = std::fs::remove_file(&file);
+        let out = out.ok()?;
         assert!(
             out.status.success(),
             "dxc -dumpbin failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    #[test]
+    fn mixed_input_interpolation_center_and_centroid() {
+        let isg1 = rows(&[("TEXCOORD", 0, false)], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        for input_addr in [1 << 1 | 1 << 2, 1 << 5 | 1 << 6] {
+            for [first, second] in [[0, 2], [2, 0]] {
+                for channel in [0, 1] {
+                    let words = [
+                        0xC810_0000 | first,                         // p1 v4, i, attr0.x
+                        0xC811_0000 | (first + 1),                   // p2 v4, j, attr0.x
+                        0xC814_0000 | (channel << 8) | second,       // p1 v5, i, attr0.ch
+                        0xC815_0000 | (channel << 8) | (second + 1), // p2 v5, j, attr0.ch
+                        0xF800_180F,
+                        0x0504_0504, // exp mrt0, v4, v5, v4, v5 done vm
+                        0xBF81_0000,
+                    ];
+                    let out = emit_pixel(&words, vec![texcoord(false)], input_addr, &isg1, &osg1)
+                        .unwrap();
+                    let host = Container::parse(&out.dxil).unwrap();
+                    let sig = host.part(FourCC::ISG1).unwrap().data;
+                    assert_eq!(sig[8 + 25], 1 | 1 << channel, "input read mask");
+                    #[cfg(windows)]
+                    if let Some(text) = dump_dxil(&out.dxil) {
+                        assert!(text.contains("dx.op.loadInput.f32(i32 4"), "{text}");
+                        assert!(text.contains("dx.op.evalCentroid.f32(i32 89"), "{text}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_input_interpolation_center_and_centroid_f16() {
+        let isg1 = rows(&[("TEXCOORD", 0, true)], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        // The centroid read is first. The signature's y channel is either
+        // in attr0.y or the upper half of attr0.x, depending on packing.
+        for (pack2, attr) in [(false, 1 << 6), (true, 1 << 8)] {
+            let words = [
+                0xD742_0006,
+                0x0002_0400 | attr, // p1ll v6, v2, attr
+                0xD75A_0004,
+                0x041A_0600 | attr, // p2 v4, attr, v3, v6
+                0xD742_0007,
+                0x0002_0000, // p1ll v7, v0, attr0.x
+                0xD75A_0005,
+                0x041E_0200, // p2 v5, attr0.x, v1, v7
+                0x7E08_1704, // v_cvt_f32_f16 v4, v4
+                0x7E0A_1705, // v_cvt_f32_f16 v5, v5
+                0xF800_180F,
+                0x0504_0504, // exp mrt0, v4, v5, v4, v5 done vm
+                0xBF81_0000,
+            ];
+            let input = crate::native::PsInput {
+                pack2,
+                ..texcoord(true)
+            };
+            let out = emit_pixel(&words, vec![input], 1 << 1 | 1 << 2, &isg1, &osg1)
+                .unwrap_or_else(|err| panic!("pack2={pack2}: {err}"));
+            let host = Container::parse(&out.dxil).unwrap();
+            let sig = host.part(FourCC::ISG1).unwrap().data;
+            assert_eq!(sig[8 + 25], 0b0011, "input read mask with pack2={pack2}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn centroid_only_interpolation_uses_load_input() {
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xBF81_0000,
+        ];
+        let isg1 = rows(&[("TEXCOORD", 0, false)], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        for input_addr in [1 << 2, 1 << 6] {
+            let out = emit_pixel(&words, vec![texcoord(false)], input_addr, &isg1, &osg1).unwrap();
+            if let Some(text) = dump_dxil(&out.dxil) {
+                assert!(text.contains("dx.op.loadInput.f32(i32 4"), "{text}");
+                assert!(!text.contains("dx.op.evalCentroid.f32"), "{text}");
+                assert!(text.to_ascii_lowercase().contains("centroid"), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_input_interpolation_incompatible_modes_fail() {
+        let isg1 = rows(&[("TEXCOORD", 0, false)], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        for (input_addr, center, other) in [
+            (1 << 0 | 1 << 1, 2, &[0xC814_0000, 0xC815_0001][..]), // perspective sample
+            (1 << 1 | 1 << 6, 0, &[0xC814_0002, 0xC815_0003][..]), // linear centroid
+            (1 << 1, 0, &[0xC816_0002][..]),                       // mov v5, p0, attr0.x
+        ] {
+            let mut words = vec![0xC810_0000 | center, 0xC811_0000 | (center + 1)];
+            words.extend(other);
+            words.extend([0xF800_180F, 0x0504_0504, 0xBF81_0000]);
+            let err =
+                emit_pixel(&words, vec![texcoord(false)], input_addr, &isg1, &osg1).unwrap_err();
+            assert!(
+                err.to_string().contains("one input interpolated two ways"),
+                "{err}"
+            );
+        }
     }
 
     #[cfg(windows)]
