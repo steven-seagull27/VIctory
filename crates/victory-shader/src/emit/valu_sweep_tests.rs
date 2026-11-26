@@ -149,19 +149,21 @@ fn want32(x: &Exact) -> Vec<Want> {
     }
 }
 
-/// What a d16 load gives for one channel (16 bits); `None`: any f16 NaN.
-/// Converted directly to f16 or through f32 first: either is accepted
-/// where they differ (the ISA does not say which).
-fn want16(x: &Exact) -> Vec<Option<u16>> {
+/// RDNA2 D16 buffer loads saturate integer fields and round normalized
+/// fields once to nearest. Floating-point fields narrow toward zero (#2064).
+/// The sweep accepts any NaN payload as before.
+fn want16(x: &Exact, num: Num) -> Option<u16> {
     match *x {
-        Exact::Int(i) => vec![Some(i as u16)],
-        Exact::Real(r) => {
-            let (direct, via) = (f16_rne(r), f16_rne(f64::from(r as f32)));
-            if direct == via { vec![Some(direct)] } else { vec![Some(direct), Some(via)] }
+        Exact::Int(i) if num == Num::Sint => {
+            Some((i as i32).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as u16)
         }
+        Exact::Int(i) => Some(i.min(u32::from(u16::MAX)) as u16),
+        Exact::Real(r) => Some(f16_rne(r)),
         Exact::F32Bits(b) => {
-            let f = f32::from_bits(b);
-            if f.is_nan() { vec![None] } else { vec![Some(f16_rne(f64::from(f)))] }
+            let f = f64::from(f32::from_bits(b));
+            let nearest = rne_or_nan(f)?;
+            // The adjacent half toward zero has a magnitude one bit pattern smaller.
+            Some(nearest - u16::from(f16v(nearest).abs() > f.abs()))
         }
     }
 }
@@ -300,7 +302,15 @@ fn print(title: &str, findings: &Findings, checked: usize) {
 #[test]
 #[ignore = "sweep: --ignored --nocapture"]
 fn sweep_typed_buffer_formats() {
-    let cases = input_cases();
+    let d16 = std::env::var_os("SWEEP_D16").is_some();
+    let mut cases = input_cases();
+    if d16 {
+        // The four 16-bit codes whose exact ratio and decoded f32 round to
+        // different halves, replicated so every channel sees them (#1940).
+        for code in [0xFFAF_u32, 0xFFEF, 0x7FF7, 0x8009] {
+            cases.push([code << 16 | code; 4]);
+        }
+    }
     let mut findings = Findings::new();
     let mut checked = 0;
     for (n, name, bits, num) in formats() {
@@ -329,7 +339,7 @@ fn sweep_typed_buffer_formats() {
                 }
             }
         }
-        if std::env::var_os("SWEEP_D16").is_none() {
+        if !d16 {
             continue;
         }
         let shader = format_shader(n, true);
@@ -338,16 +348,16 @@ fn sweep_typed_buffer_formats() {
                 checked += 2; // two packed dwords per row
                 for ch in 0..4 {
                     let g = (row[ch / 2] >> (16 * (ch % 2))) as u16;
-                    let wants = want16(&refs[i][ch]);
-                    let ok = wants.iter().any(|w| match *w {
+                    let want = want16(&refs[i][ch], num);
+                    let ok = match want {
                         Some(b) => b == g,
                         None => is_f16_nan(g),
-                    });
+                    };
                     if !ok {
                         note(
                             &mut findings,
                             format!("{backend} fmt {n} {name} d16 ch{ch}"),
-                            format!("in {:08x?} got {g:#06x} want {wants:x?}", cases[i]),
+                            format!("in {:08x?} got {g:#06x} want {want:x?}", cases[i]),
                         );
                     }
                 }
