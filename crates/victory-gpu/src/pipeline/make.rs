@@ -254,15 +254,87 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Pipelines for the workers: those draws wait for, then those started
-/// early.
-static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
-    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
+/// Pipelines for the workers, taken in this order: graphics ones draws
+/// wait for, compute ones dispatches wait for, then graphics and compute
+/// ones started early (at creation, because an earlier run used them).
+///
+/// Graphics go first, and compute never takes every worker: in Grand Theft
+/// Auto VI's world some 180 compute pipelines take the host driver 3.7 s
+/// each on average (up to 24 s; the other compute ones 0.1 s), and queued
+/// in order of first use they held all workers for minutes while the
+/// scene's graphics pipelines, made in milliseconds, waited behind them
+/// and their draws were dropped.
+#[derive(Default)]
+struct Queues {
+    /// The four queues, in the order they are taken.
+    queues: [VecDeque<Arc<Pending>>; 4],
+    /// Workers making a compute pipeline now: kept below the workers, so one
+    /// is always free for graphics. Held by the same lock as the queues, so
+    /// that giving the slot back and waking a worker cannot race.
+    compute_busy: usize,
+}
+static QUEUES: (Mutex<Queues>, Condvar) = (
+    Mutex::new(Queues {
+        queues: [const { VecDeque::new() }; 4],
+        compute_busy: 0,
+    }),
+    Condvar::new(),
+);
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// The queue of a pipeline a draw waits for (`now`) or started early.
+fn queue_index(p: &Pending, now: bool) -> usize {
+    usize::from(p.graphics.is_none()) + if now { 0 } else { 2 }
+}
+
+/// The pipeline workers (half the logical processors, 2 to 8), started on
+/// first use; 0 if none could be.
+static WORKERS: OnceLock<usize> = OnceLock::new();
+
+/// Takes the next pipeline for a worker, if one may be taken now, and
+/// whether it is a compute one (counted in `compute_busy`). `workers` is how
+/// many the machine gave.
+fn next(queues: &mut Queues, workers: usize) -> Option<(Arc<Pending>, bool)> {
+    // With one worker only, compute has to take it (else nothing compute is
+    // ever made).
+    let compute_free = queues.compute_busy + 1 < workers.max(2);
+    for (i, q) in queues.queues.iter_mut().enumerate() {
+        let compute = i % 2 == 1;
+        if compute && !compute_free {
+            continue;
+        }
+        // A pipeline in two queues is taken once: the other entry's turn is
+        // no work, and must not take a compute slot.
+        while let Some(p) = q.pop_front() {
+            if p.taken.load(Ordering::Relaxed) {
+                continue;
+            }
+            if compute {
+                queues.compute_busy += 1;
+            }
+            return Some((p, compute));
+        }
+    }
+    None
+}
+
+/// A compute slot taken by a worker, given back when it goes (also on a
+/// panic in the compiler, which would otherwise keep it for good).
+struct ComputeSlot(bool);
+
+impl Drop for ComputeSlot {
+    fn drop(&mut self) {
+        if self.0 {
+            let (lock, work) = &QUEUES;
+            let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
+            queues.compute_busy -= 1;
+            // Under the lock: a worker about to sleep cannot miss this.
+            work.notify_one();
+        }
+    }
+}
+
+/// Hands `p` to the workers, started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
-    static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
         let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         (0..n)
@@ -285,8 +357,9 @@ fn queue(p: Arc<Pending>, now: bool) {
         }
         return;
     }
+    let i = queue_index(&p, now);
     let (lock, work) = &QUEUES;
-    lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
+    lock.lock().unwrap_or_else(|e| e.into_inner()).queues[i].push_back(p);
     work.notify_one();
 }
 
@@ -300,12 +373,13 @@ fn work() {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
     let (lock, work) = &QUEUES;
+    let workers = *WORKERS.get().unwrap_or(&1);
     loop {
-        let p = {
+        let (p, compute) = {
             let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(p) = queues.iter_mut().find_map(VecDeque::pop_front) {
-                    break p;
+                if let Some(next) = next(&mut queues, workers) {
+                    break next;
                 }
                 let (held, waited) = work
                     .wait_timeout(queues, Duration::from_secs(20))
@@ -319,8 +393,11 @@ fn work() {
             }
         };
         if p.taken.swap(true, Ordering::Relaxed) {
-            continue; // its other queue entry
+            continue; // its other queue entry: no work, no slot, not queued
         }
+        // The slot goes back when this scope ends, a panic included; a
+        // worker that found no compute to take is woken there.
+        let _slot = ComputeSlot(compute);
         p.make();
         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
             drained();
@@ -351,6 +428,45 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four queues in the order they are taken, and compute never
+    /// taking the last worker.
+    #[test]
+    fn graphics_go_first_and_compute_leaves_a_worker() {
+        let compute = |key: &str| {
+            #[cfg(feature = "diagnostics")]
+            let mut p = Pending::new(Vec::new(), None, &[]);
+            #[cfg(not(feature = "diagnostics"))]
+            let mut p = Pending::new(Vec::new(), None);
+            p.key = key.to_owned();
+            Arc::new(p)
+        };
+        let mut queues = Queues::default();
+        queues.queues[3].push_back(compute("early compute"));
+        queues.queues[2].push_back(compute("early graphics"));
+        queues.queues[0].push_back(compute("graphics a draw waits for"));
+        // A compute pipeline a dispatch waits for and one started early.
+        queues.queues[1].push_back(compute("compute a dispatch waits for"));
+        assert_eq!(queue_index(&compute("c"), true), 1);
+        assert_eq!(queue_index(&compute("c"), false), 3);
+        // Graphics first, then compute, then the early starts. Two workers:
+        // one compute at a time, so one is always free.
+        let taken: Vec<String> = std::iter::from_fn(|| next(&mut queues, 2))
+            .map(|(p, _)| p.key.clone())
+            .collect();
+        assert_eq!(
+            taken,
+            ["graphics a draw waits for", "compute a dispatch waits for", "early graphics"]
+        );
+        // One compute is being made: with two workers, the other one is
+        // free for graphics, so the early compute one waits.
+        assert_eq!(queues.compute_busy, 1);
+        assert_eq!(queues.queues[3].len(), 1, "the early compute one is left for later");
+        // A single worker has to take compute, else none is ever made.
+        let mut queues = Queues::default();
+        queues.queues[1].push_back(compute("compute"));
+        assert!(next(&mut queues, 1).is_some());
+    }
 
     /// An early start is queued once; a draw waiting for it puts it ahead,
     /// once, unless a worker has taken it.
