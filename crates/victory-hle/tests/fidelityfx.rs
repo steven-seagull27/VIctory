@@ -474,6 +474,17 @@ fn the_titles_upscaler_runs_on_the_host() {
             "written through an FP16 texture"
         }
     );
+    // A non-writable RGBA8 output cannot receive the RGB9E5 packer's rows.
+    // Common is a valid starting state, but it does not give the resource a UAV.
+    let read_only = at(output, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+    for state in [0x2, 0x1] {
+        upscaling.resources[6] = described(read_only, 10, output, 0, state);
+        assert_eq!(dispatch(&mut context, &mut upscaling.header), 6);
+    }
+    // An unsupported starting state must be refused even for an RGB9E5 output.
+    upscaling.resources[6] = described(packed, 4, output, 2, 0x40);
+    assert_eq!(dispatch(&mut context, &mut upscaling.header), 6);
+
     // Two frames into each output: the first resets the history.
     for out in [upscaled, packed] {
         upscaling.resources[6] = described(out, 4, output, 2, 0x2);

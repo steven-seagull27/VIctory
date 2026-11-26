@@ -30,7 +30,10 @@ use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
 
 use victory_gpu::object::Object;
-use windows::Win32::Graphics::Direct3D12::ID3D12Device;
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, ID3D12Device,
+};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
 use windows::core::Interface;
 
 use crate::{HleModule, hle_export};
@@ -424,31 +427,43 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         if r.resource.is_null() {
             continue;
         }
-        let wanted = host_state(r.state);
-        let in_state = |w| {
-            victory_gpu::external::host_texture(list, r.resource.cast::<Object>(), w)
-                .filter(|&(_, state)| state == w)
-        };
-        let mut texture = wanted.and_then(in_state);
-        let unwritable = texture
-            .as_ref()
-            .is_none_or(|(t, _)| !victory_gpu::rgb9e5::stores(t));
-        if unwritable && i == OUTPUT {
-            let size = [r.description[2], r.description[3]];
-            if let Some(bridge) = victory_gpu::rgb9e5::bridge(size)
-                && let Some((title, _)) = in_state(COPY_DEST)
-            {
-                once!(
-                    info,
-                    ?size,
-                    "FidelityFX: the output is written through an FP16 texture"
-                );
-                r.description[1] = RGBA16_FLOAT;
-                packed = Some((bridge, title));
-                texture = Some((bridge.texture().clone(), wanted.unwrap_or(0)));
+        let host_texture =
+            |state| victory_gpu::external::host_texture(list, r.resource.cast::<Object>(), state);
+        let texture = host_state(r.state).and_then(|wanted| {
+            let (title, state) = host_texture(wanted)?;
+            if i != OUTPUT {
+                return (state == wanted).then_some(title);
             }
-        }
-        let Some((texture, _)) = texture else {
+            // SAFETY: this is the live host texture that the upscaler would receive.
+            let desc = unsafe { title.GetDesc() };
+            if state == wanted
+                && desc
+                    .Flags
+                    .contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+                && victory_gpu::rgb9e5::stores(&title)
+            {
+                return Some(title);
+            }
+            if desc.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP {
+                return None;
+            }
+            let size = [r.description[2], r.description[3]];
+            let bridge = victory_gpu::rgb9e5::bridge(size)?;
+            let (title, state) = host_texture(COPY_DEST)?;
+            if state != COPY_DEST {
+                return None;
+            }
+            once!(
+                info,
+                ?size,
+                "FidelityFX: the output is written through an FP16 texture"
+            );
+            r.description[1] = RGBA16_FLOAT;
+            r.state = 0x2; // The FP16 bridge starts and finishes in unordered access.
+            packed = Some((bridge, title));
+            Some(bridge.texture().clone())
+        });
+        let Some(texture) = texture else {
             once!(
                 warn,
                 state = r.state,

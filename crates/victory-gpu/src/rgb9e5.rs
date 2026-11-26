@@ -26,7 +26,7 @@ use crate::host::{host, transition};
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u0)"
 cbuffer Size : register(b0) { uint width; uint height; uint from_pitch; uint to_pitch; };
-// FP16 RGBA rows, as DLSS wrote them.
+// FP16 RGBA rows written by the upscaler.
 ByteAddressBuffer from : register(t0);
 // RGB9E5 rows, for the title's texture.
 RWByteAddressBuffer to : register(u0);
