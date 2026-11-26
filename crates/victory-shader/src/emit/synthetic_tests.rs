@@ -11,7 +11,7 @@ use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
-use crate::{io, ir, resource, structure};
+use crate::{io, ir, range, resource, structure};
 
 /// Per lane (32, wave32): the record [offset word, u, v, level] at entry 1
 /// of the table at s0 (a 2D texture at entry 0, a raw UAV at entry 2); the
@@ -138,8 +138,8 @@ fn build_shader(native: &NativeProgram) -> Result<HostShader, crate::ShaderError
 }
 
 fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
+    let (p, st) = range::build_native(native)?;
+    let st = st?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, native).expect("io::raise");
     lower::lower(&lower::Parts {
@@ -1340,4 +1340,91 @@ fn pixel_shader_vcc_branch_uses_per_lane_decision() {
                 .expect("DXIL validation failed");
         }
     }
+}
+
+#[test]
+fn pixel_vcc_fallback_preserves_a_dead_descriptor_field() {
+    let mut words = [
+        0xBE84_0308u32,
+        0xBE85_0380, // s[4:5] = descriptor table
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0
+        0x7E00_0280,
+        0x7E02_0280, // image coordinates (0, 0)
+        0xBF8C_C07F, // wait for the descriptor
+        0xF000_3F88,
+        0x0003_0200, // image_load v[2:5], v[0:1], s[12:19]
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0002, // s_cbranch_scc1 -> join
+        0xBE8C_0385, // s_mov_b32 s12, 5
+        0x7E02_02C1, // v_mov_b32 v1, -1
+        0x7D84_02C1, // join: v_cmp_eq_u32 vcc, -1, v1
+        0xBF86_0003, // s_cbranch_vccz -> export
+        0xBF07_800C, // s_cmp_lg_u32 s12, 0
+        0xBF85_0001, // s_cbranch_scc1 -> export
+        0xBE84_0380, // s_mov_b32 s4, 0
+        0xF800_1890,
+        0,           // exp null
+        0xBF81_0000, // s_endpgm
+    ];
+    let translate = |words: &[u32]| {
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: true,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 8,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 8,
+                slot: 1,
+            }],
+            io: StageIo::Ps {
+                inputs: Vec::new(),
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        lowered(&native).map(|program| program.dxil)
+    };
+    let mut dxil = translate(&words).expect("only the arm that overwrote the descriptor reads s12");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut dxil).expect("DXIL validation");
+    }
+    words[9] = 0x7E02_02C1; // both arms leave v1 = -1
+    let error = translate(&words).expect_err("the descriptor field is now live");
+    assert!(
+        matches!(
+            error,
+            crate::ShaderError::Unsupported {
+                what: "a descriptor's address or format read as data",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
 }

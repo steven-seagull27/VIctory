@@ -404,7 +404,7 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
         })?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
-    let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let (p, st) = crate::range::build_native(&native)?;
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
