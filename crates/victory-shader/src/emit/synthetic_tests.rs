@@ -1027,3 +1027,49 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
     // never spinning to LOOP_LIMIT (1 << 20).
     assert_eq!(pixels, vec![[0.0; 4], [0.0; 4], [1.0; 4], [1.0; 4]]);
 }
+
+/// A saved EXEC mask supplies the condition for a select, whose result is
+/// compared before a branch. The B32 form leaves s25 at its initial zero.
+fn entry_mask_branch(full_width: bool) {
+    let wrexec = if full_width { 0xBE98_3A14 } else { 0xBE98_4714 };
+    for threshold in [8, 40] {
+        let body = [
+            0xBE94_047E, // s_mov_b64 s[20:21], exec
+            0xBE99_0380, // s_mov_b32 s25, 0
+            0x4A06_00FF, 0xBEEF_0000, // v3 = old tag + lane
+            0x4A04_00FF, 0xCAFE_0000, // v2 = new tag + lane
+            0x7D88_0080 | threshold, // v_cmp_gt_u32 vcc, threshold, v0
+            0xBE96_246A, // s_and_saveexec_b64 s[22:23], vcc
+            wrexec,      // s_andn2_wrexec_b32/b64 s24[:25], s20[:21]
+            0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+            0xD501_0003, 259 | (258 << 9) | (24 << 18), // v_cndmask_b32 v3, v3, v2, s[24:25]
+            0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0
+            0xBE9A_246A, // s_and_saveexec_b64 s[26:27], vcc
+            0x7D88_0103, // v_cmp_gt_u32 vcc, v3, v0
+            0xBE9C_246A, // s_and_saveexec_b64 s[28:29], vcc
+            0xBF88_0001, // s_cbranch_execz over the update
+            0x4A06_0681, // v_add_nc_u32 v3, 1, v3
+            0xBEFE_041A, // s_mov_b64 exec, s[26:27]
+        ];
+        let expected = (0..64)
+            .map(|lane| {
+                let selected = lane >= threshold && (full_width || lane < 32);
+                let tag = if selected { 0xCAFE_0000 } else { 0xBEEF_0000 };
+                tag + lane + u32::from(lane < 16)
+            })
+            .collect::<Vec<_>>();
+        run_permute_cs(true, &body, &expected);
+    }
+}
+
+#[test]
+#[ignore = "companion control for the mixed-width mask diagnostic"]
+fn entry_mask_branch_b64_control() {
+    entry_mask_branch(true);
+}
+
+#[test]
+#[ignore = "mixed-width diagnostic reproducer for PR 2936"]
+fn entry_mask_branch_b32_reproducer() {
+    entry_mask_branch(false);
+}
