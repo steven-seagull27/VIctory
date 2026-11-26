@@ -22,6 +22,7 @@ pub(super) fn mask_uses_console_lanes(
         LaneExit::Branch { when, .. } => Some(when),
         _ => None,
     });
+    let mut partial_inline_select = false;
     let selects = p
         .blocks
         .iter()
@@ -41,7 +42,13 @@ pub(super) fn mask_uses_console_lanes(
             ) {
                 return None;
             }
-            let &Operand::Scalar { code, .. } = v.src.get(2)? else {
+            let source = v.src.get(2)?;
+            if let &Operand::Const(k) = source {
+                partial_inline_select |= i.name() == "v_cndmask_b32"
+                    && crate::resource::inline(k).is_some_and(|x| x != 0 && x != u32::MAX);
+                return None;
+            }
+            let &Operand::Scalar { code, .. } = source else {
                 return None;
             };
             if code == NULL {
@@ -65,6 +72,9 @@ pub(super) fn mask_uses_console_lanes(
         .chain(whens)
         .chain(selects)
         .collect();
+    if partial_inline_select {
+        return true;
+    }
     while let Some(g) = work.pop() {
         if !seen_bools.insert(g) {
             continue;
