@@ -5,10 +5,12 @@
 
 mod census;
 mod inspect;
+mod prebuild;
 mod run;
 mod shader;
 mod translate;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -57,15 +59,21 @@ enum Command {
         list: bool,
     },
     /// Find shader containers in files or directories (also inside engine
-    /// archives, if uncompressed) and report their layout.
+    /// archives, if uncompressed) and report their layout. Shader packs
+    /// among the paths are listed last, their stages named from the
+    /// containers found.
     ShaderInfo {
         paths: Vec<PathBuf>,
-        /// Print one line per container found.
+        /// Print one line per container found (and per pack pipeline).
         #[arg(long)]
         verbose: bool,
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
         disasm: bool,
+        /// Instead list the effects of shader databases: technique, pass,
+        /// shaders (name, container hash, engine hash) and pass state.
+        #[arg(long)]
+        effects: bool,
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
@@ -75,15 +83,23 @@ enum Command {
         /// else the newest Windows SDK's).
         #[arg(long)]
         validate: bool,
-        /// Also create a host D3D12 pipeline for each emitted shader.
+        /// Also create a host D3D12 pipeline for each emitted shader. With
+        /// `--cache`: then make every pipeline of the title's shader pack
+        /// into the host pipeline library `run` reads (on this GPU and
+        /// driver; a second time only what is not there yet).
         #[arg(long)]
         pipelines: bool,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
-        /// Worker threads (default: every logical core).
+        /// Positive worker thread count (default: every logical core).
         #[arg(long)]
-        jobs: Option<usize>,
+        jobs: Option<NonZeroUsize>,
+        /// Only translate into the shader cache `run` reads (the warm-up):
+        /// every container found, once, nothing else checked or listed
+        /// (with `--pipelines`, then the shader pack's pipelines).
+        #[arg(long, conflicts_with_all = ["validate", "list"])]
+        cache: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -121,6 +137,11 @@ enum Console {
     SeriesS,
 }
 
+/// Diagnostics: the heap bytes Rust code holds, for the statistics.
+#[cfg(all(windows, feature = "diagnostics"))]
+#[global_allocator]
+static ALLOC: victory_gpu::CountingAlloc = victory_gpu::CountingAlloc;
+
 fn main() -> Result<()> {
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
@@ -145,14 +166,29 @@ fn main() -> Result<()> {
             paths,
             verbose,
             disasm,
-        } => shader::run(paths, verbose || disasm, disasm),
+            effects,
+        } => shader::run(paths, verbose || disasm, disasm, effects),
+        Command::Translate {
+            paths,
+            jobs,
+            pipelines,
+            cache: true,
+            ..
+        } => translate::warm(paths, jobs.map(NonZeroUsize::get), pipelines),
         Command::Translate {
             paths,
             validate,
             pipelines,
             list,
             jobs,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+            cache: false,
+        } => translate::run(
+            paths,
+            validate,
+            pipelines,
+            list,
+            jobs.map(NonZeroUsize::get),
+        ),
         Command::Run {
             exe,
             unimplemented,
@@ -160,7 +196,14 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            let code = run::run(&exe, unimplemented, strict, execute, console)?;
+            if code != 0 {
+                // Preserve all 32 bits of the Windows process status.
+                std::process::exit(code as i32);
+            }
+            Ok(())
+        }
         Command::Config => show_config(),
     }
 }
@@ -181,9 +224,17 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
+    println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
+    check_policy(&cfg)
+}
+
+/// Reports each configured path the asset policy refuses, and fails if
+/// there is one, so that `victory config` exits nonzero.
+fn check_policy(cfg: &victory_core::Config) -> Result<()> {
+    let mut violations = 0;
     for p in cfg
         .game_dir
         .iter()
@@ -192,8 +243,13 @@ fn show_config() -> Result<()> {
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");
+            violations += 1;
         }
     }
+    anyhow::ensure!(
+        violations == 0,
+        "{violations} configured path(s) violate the asset policy"
+    );
     Ok(())
 }
 
@@ -209,4 +265,37 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::check_policy;
+
+    fn outside() -> PathBuf {
+        std::env::temp_dir().join("victory-config-test")
+    }
+
+    #[test]
+    fn config_check_passes_paths_outside_the_repository() {
+        let cfg = victory_core::Config {
+            cache_dir: outside().join("cache"),
+            data_dir: outside().join("data"),
+            ..Default::default()
+        };
+        assert!(check_policy(&cfg).is_ok());
+    }
+
+    #[test]
+    fn config_check_fails_a_path_inside_the_repository() {
+        let cfg = victory_core::Config {
+            game_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("game")),
+            cache_dir: outside().join("cache"),
+            data_dir: outside().join("data"),
+            ..Default::default()
+        };
+        let err = check_policy(&cfg).unwrap_err();
+        assert!(err.to_string().contains("1 configured path"), "{err}");
+    }
 }
