@@ -131,6 +131,59 @@ impl MaskTrace {
 }
 
 impl Lower<'_> {
+    /// Print the decoded operands and their SSA roles at selected machine
+    /// byte offsets. Only called when an opted-in mask refusal escapes.
+    #[cfg(feature = "diagnostics")]
+    fn trace_mask_operands(&self, offsets: &str) {
+        use crate::ir::Reg;
+        let offsets: std::collections::BTreeSet<_> = offsets
+            .split(',')
+            .map(str::trim)
+            .filter_map(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .collect();
+        let p = self.x.p;
+        let st = self.x.st;
+        for (block, b) in p.blocks.iter().enumerate() {
+            for inst in &b.insts {
+                if !offsets.contains(&inst.machine.offset) {
+                    continue;
+                }
+                eprintln!(
+                    "mask operands: wave{} b{block} at {:#x} {}",
+                    if p.wave64 { 64 } else { 32 },
+                    inst.machine.offset,
+                    inst.machine.text(p.wave64)
+                );
+                for (role, operands) in [("read", &inst.reads), ("write", &inst.writes)] {
+                    for &(reg, value) in operands {
+                        let pair = match reg {
+                            Reg::S(n) if p.wave64 && n % 2 == 0 => operands
+                                .iter()
+                                .find(|&&(r, _)| r == Reg::S(n + 1))
+                                .and_then(|&(_, hi)| st.mask_bits(value, Some(hi))),
+                            _ => None,
+                        };
+                        let stored = match self.vals.get(&value) {
+                            Some(super::Val::I32(_)) => "i32",
+                            Some(super::Val::Bit(_)) => "bit",
+                            Some(super::Val::Missing(why)) => why,
+                            None => "none",
+                        };
+                        eprintln!(
+                            "  {role} {reg:?}={value:?} entry={} mask={:?} other={:?} high_of={:?} pair={pair:?} active={} lane_bit={} stored={stored}",
+                            p.inputs.contains(&(reg, value)),
+                            st.masks.get(&value),
+                            st.other.get(&value),
+                            st.highs.get(&value),
+                            st.active.contains(&value),
+                            self.lane_bits.contains_key(&value)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn atom(&mut self, atom: Atom, at: usize) -> Result<V, Why> {
         let result = self.atom_inner(atom, at);
         #[cfg(feature = "diagnostics")]
@@ -188,8 +241,11 @@ impl Lower<'_> {
 
     pub(super) fn traced_refusal(&self, offset: usize, why: Why, site: &'static str) -> Stop {
         #[cfg(feature = "diagnostics")]
-        if why == LANE_MASK {
+        if why == LANE_MASK && self.mask_trace.enabled {
             self.mask_trace.report(self.x, offset, site);
+            if let Ok(offsets) = std::env::var("VICTORY_TRACE_LANE_MASK_AT") {
+                self.trace_mask_operands(&offsets);
+            }
         }
         #[cfg(not(feature = "diagnostics"))]
         let _ = site;
