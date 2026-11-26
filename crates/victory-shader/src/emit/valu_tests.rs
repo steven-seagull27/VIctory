@@ -211,7 +211,7 @@ fn run_cases_with_wave_size(
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
+    let mut device_available = false;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let host = match Host::new(warp) {
             Ok(host) => host,
@@ -220,6 +220,7 @@ fn run_cases_with_wave_size(
                 continue;
             }
         };
+        device_available = true;
         if let Some(size) = wave_size {
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
             // SAFETY: the feature selector requires a writable OPTIONS1 of this size.
@@ -264,25 +265,26 @@ fn run_cases_with_wave_size(
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
             check(label, i, inputs, out[0][0]);
         }
-        ran += 1;
     }
-    assert!(
-        ran > 0 || wave_size.is_some(),
-        "neither hardware nor WARP SM 6.6 device available"
-    );
+    assert!(device_available, "neither hardware nor WARP SM 6.6 device available");
 }
 
 #[test]
 fn ds_swizzle_reads_only_active_compute_lanes() {
     let value = 0xdead_beef;
+    let mut mismatches = Vec::new();
     for (offset, threads, narrow, expected) in [
         (0x041f, 1, false, 0), // bitmask-mode swap adjacent lanes
         (0x041f, 2, true, 0),
         (0x80b1, 2, true, 0), // quad-mode swap adjacent lanes
-        (0x041f, 2, false, value),
-        (0x80b1, 2, false, value),
+        (0x041f, 2, false, value + 1),
+        (0x80b1, 2, false, value + 1),
+        (0x041f, 32, false, value + 1),
+        (0x80b1, 32, false, value + 1),
     ] {
         let mut words = vec![vop1(0x001, 5, 128)];
+        // Distinguish lane 1's result from a read of lane 0's own value.
+        words.push(0x4A02_0101); // v_add_nc_u32 v1, v1, v0 (local thread ID)
         if narrow {
             words.push(0x7DA4_0080); // v_cmpx_eq_u32 0, v0 (local thread ID)
         }
@@ -295,13 +297,15 @@ fn ds_swizzle_reads_only_active_compute_lanes() {
             &[[value, 0, 0, 0]],
             Some(32),
             |backend, _, _, got| {
-                assert_eq!(
-                    got, expected,
-                    "{backend}: offset {offset:#x}, {threads} threads, narrowed {narrow}"
-                );
+                if got != expected {
+                    mismatches.push(format!(
+                        "{backend}: offset {offset:#x}, {threads} threads, narrowed {narrow}: got {got:#x}, expected {expected:#x}"
+                    ));
+                }
             },
         );
     }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 #[test]
