@@ -2959,7 +2959,8 @@ mod tests {
         }
     }
 
-    /// The depth and stencil planes of an array mip have different row formats.
+    /// Compare guest copies of every depth/stencil mip and slice to the same
+    /// device's native readback. The title buffer has extra pitch and gaps.
     #[cfg(windows)]
     #[test]
     fn depth_and_stencil_planes_reach_the_guest_buffer() {
@@ -3008,97 +3009,136 @@ mod tests {
         type Copy =
             extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
         const DEPTH_WRITE: u32 = 0x10;
+        use windows::core::Interface;
+        const MIPS: u32 = 3;
+        const SLICES: u32 = 2;
+        const IMAGES: u32 = MIPS * SLICES;
+        const PLANES: usize = (2 * IMAGES) as usize;
+        const COPY_SOURCE: u32 = 0x800;
         let mut failures = Vec::new();
         for (storage, view) in [(45, 45), (44, 45), (20, 20), (19, 20)] {
-            let mut desc = texture(8, 4, storage, 2);
-            desc.depth_or_array_size = 2;
-            desc.flags = 2; // ALLOW_DEPTH_STENCIL
+            let mut desc = texture(131, 9, storage, MIPS as u16);
+            desc.depth_or_array_size = SLICES as u16;
+            desc.flags = 2;
             let image = create(&desc, DEPTH_WRITE);
-            let target = create(&buffer(4096), 0);
-            let (out, _) = buffer_bytes(target).unwrap();
-            // SAFETY: the guest target buffer holds 4096 bytes.
-            unsafe { out.write_bytes(0xee, 4096) };
+            let texture = host_resource(image).unwrap();
             let mut list = null;
             assert_eq!(
-                crate::list::create_list(null, 0, 0, allocator, null, iid, &mut list,),
+                crate::list::create_list(null, 0, 0, allocator, null, iid, &mut list),
                 S_OK
             );
-            let texture = host_resource(image).unwrap();
-            let dsv = host.dsv(
-                &texture,
-                Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
-                    Format: DXGI_FORMAT(view),
-                    ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DARRAY,
-                    Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
-                        Texture2DArray: D3D12_TEX2D_ARRAY_DSV {
-                            MipSlice: 1,
-                            FirstArraySlice: 1,
-                            ArraySize: 1,
-                        },
-                    },
-                    ..Default::default()
-                }),
-            );
-            let host_list = crate::list::host_list(list).unwrap();
-            // Track the fixture's native clears before readback sets COPY_SOURCE.
-            crate::list::ensure_state(host_list, image, DEPTH_WRITE);
-            let native = &host_list.list;
-            let flags = D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
-            let left = RECT {
-                left: 0,
-                top: 0,
-                right: 2,
-                bottom: 2,
-            };
-            // SAFETY: a live DSV into the selected mip and array slice.
+            let recording = crate::list::host_list(list).unwrap();
+            crate::list::ensure_state(recording, image, DEPTH_WRITE);
+
+            let mut layouts = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); PLANES];
+            let mut rows = [0; PLANES];
+            let mut widths = [0; PLANES];
+            // SAFETY: the live texture has two planes of six subresources each.
             unsafe {
-                native.ClearDepthStencilView(dsv, flags, 0.75, 0x91, None);
-                native.ClearDepthStencilView(dsv, flags, 0.25, 0x37, Some(&[left]));
-            }
-            let (left, right) = if view == 45 {
-                (0x0040_0000u32, 0x00bf_ffffu32)
-            } else {
-                (0.25_f32.to_bits(), 0.75_f32.to_bits())
+                host.device.GetCopyableFootprints(
+                    &texture.GetDesc(),
+                    0,
+                    PLANES as u32,
+                    512,
+                    Some(layouts.as_mut_ptr()),
+                    Some(rows.as_mut_ptr()),
+                    Some(widths.as_mut_ptr()),
+                    None,
+                )
             };
-            let depth_row: Vec<_> = [left, left, right, right]
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect();
-            let stencil_row = [0x37, 0x37, 0x91, 0x91];
-            let mut expected = vec![0xeeu8; 4096];
-            let copy = slot::<Copy>(list, 0x80);
-            for (index, start, format, row) in [
-                (3, 512, 39, depth_row.as_slice()),
-                (7, 1536, 60, stencil_row.as_slice()),
-            ] {
-                let mut footprint = NO_FOOTPRINT;
+            for sub in 0..IMAGES {
+                let dsv = host.dsv(
+                    &texture,
+                    Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+                        Format: DXGI_FORMAT(view),
+                        ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DARRAY,
+                        Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                            Texture2DArray: D3D12_TEX2D_ARRAY_DSV {
+                                MipSlice: sub % MIPS,
+                                FirstArraySlice: sub / MIPS,
+                                ArraySize: 1,
+                            },
+                        },
+                        ..Default::default()
+                    }),
+                );
+                let fp = layouts[sub as usize].Footprint;
+                let corner = RECT {
+                    left: (fp.Width / 2) as i32,
+                    top: (fp.Height / 2) as i32,
+                    right: fp.Width as i32,
+                    bottom: fp.Height as i32,
+                };
+                let flags = D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
+                // SAFETY: this DSV names one valid array mip in DEPTH_WRITE.
+                unsafe {
+                    recording.list.ClearDepthStencilView(
+                        dsv,
+                        flags,
+                        (2 * sub + 1) as f32 / 32.0,
+                        0x31 + sub as u8,
+                        None,
+                    );
+                    recording.list.ClearDepthStencilView(
+                        dsv,
+                        flags,
+                        (2 * sub + 17) as f32 / 32.0,
+                        0xa2 + sub as u8,
+                        Some(&[corner]),
+                    );
+                }
+            }
+            let mut end = 512u64;
+            let mut guest = Vec::new();
+            for i in 0..PLANES {
+                let mut fp = NO_FOOTPRINT;
+                let (mut nrows, mut bytes) = (0, 0);
                 copyable_footprints(
                     null,
                     &desc,
-                    index,
+                    i as u32,
                     1,
-                    start,
-                    &mut footprint,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
+                    end + 512,
+                    &mut fp,
+                    &mut nrows,
+                    &mut bytes,
                     std::ptr::null_mut(),
                 );
+                let native = layouts[i].Footprint;
                 assert_eq!(
-                    footprint,
-                    PlacedFootprint {
-                        offset: start,
-                        format,
-                        width: 4,
-                        height: 2,
-                        depth: 1,
-                        row_pitch: 512,
-                    }
+                    (fp.width, fp.height, fp.format, nrows, bytes),
+                    (
+                        native.Width,
+                        native.Height,
+                        native.Format.0 as u32,
+                        rows[i],
+                        widths[i]
+                    )
                 );
+                // Give each guest row more padding than the native oracle uses.
+                fp.row_pitch += 512;
+                end = fp.offset + u64::from(nrows - 1) * u64::from(fp.row_pitch) + bytes;
+                guest.push(fp);
+            }
+            let target = create(&buffer(end), 0);
+            let (out, len) = buffer_bytes(target).unwrap();
+            assert_eq!(len, end);
+            // SAFETY: the committed target contains exactly end bytes.
+            unsafe { out.write_bytes(0xee, end as usize) };
+            let last = PLANES - 1;
+            let native_end = layouts[last].Offset
+                + u64::from(rows[last] - 1) * u64::from(layouts[last].Footprint.RowPitch)
+                + widths[last];
+            let (reference, mapped) = recording.readback(host, native_end).unwrap();
+            let copy = slot::<Copy>(list, 0x80);
+            crate::list::ensure_state(recording, image, COPY_SOURCE);
+            for i in (0..PLANES).rev() {
+                let footprint = guest[i];
                 let from = Location {
                     resource: image,
                     kind: 0,
                     footprint: PlacedFootprint {
-                        offset: u64::from(index),
+                        offset: i as u64,
                         ..footprint
                     },
                 };
@@ -3108,20 +3148,88 @@ mod tests {
                     footprint,
                 };
                 copy(list, &to, 0, 0, 0, &from, null.cast());
-                for at in [start as usize, start as usize + 512] {
-                    expected[at..at + row.len()].copy_from_slice(row);
-                }
+                let native_from = Location {
+                    resource: texture.as_raw().cast_const().cast(),
+                    ..from
+                };
+                let native_to = Location {
+                    resource: reference.as_raw().cast_const().cast(),
+                    kind: 1,
+                    footprint: PlacedFootprint {
+                        offset: layouts[i].Offset,
+                        row_pitch: layouts[i].Footprint.RowPitch,
+                        ..footprint
+                    },
+                };
+                // SAFETY: the native readback uses the device's layout for this entire subresource.
+                unsafe {
+                    recording.list.CopyTextureRegion(
+                        (&raw const native_to).cast(),
+                        0,
+                        0,
+                        0,
+                        (&raw const native_from).cast(),
+                        None,
+                    )
+                };
             }
             assert_eq!(
                 slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
                 S_OK
             );
             slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
-            // SAFETY: the guest buffer still lives and the submission has run.
-            let actual = unsafe { std::slice::from_raw_parts(out, 4096) };
-            if actual != expected {
-                failures.push((storage, actual.iter().all(|&byte| byte == 0xee)));
+            // SAFETY: both buffers are live and the queue completed all copies.
+            let (actual, oracle) = unsafe {
+                (
+                    std::slice::from_raw_parts(out, end as usize),
+                    std::slice::from_raw_parts(mapped, native_end as usize),
+                )
+            };
+            let mut expected = vec![0xee; end as usize];
+            let mut counts = [0usize; 2];
+            let mut wrong = [0usize; 2];
+            for (i, fp) in guest.iter().enumerate() {
+                let plane = i / IMAGES as usize;
+                let sub = i % IMAGES as usize;
+                let bpp = if plane == 0 { 4 } else { 1 };
+                for y in 0..fp.height as usize {
+                    let src = layouts[i].Offset as usize + y * layouts[i].Footprint.RowPitch as usize;
+                    let dst = fp.offset as usize + y * fp.row_pitch as usize;
+                    let bytes = widths[i] as usize;
+                    expected[dst..dst + bytes].copy_from_slice(&oracle[src..src + bytes]);
+                    for x in 0..fp.width as usize {
+                        let at = src + x * bpp;
+                        let hi = x >= fp.width as usize / 2 && y >= fp.height as usize / 2;
+                        if plane == 1 {
+                            assert_eq!(oracle[at], (if hi { 0xa2 } else { 0x31 }) + sub as u8);
+                        } else {
+                            let d = (2 * sub + if hi { 17 } else { 1 }) as f64 / 32.0;
+                            let v = u32::from_le_bytes(oracle[at..at + 4].try_into().unwrap());
+                            if view == 45 {
+                                assert_eq!(v & 0x00ff_ffff, (d * 16_777_215.0).round() as u32);
+                            } else {
+                                assert_eq!(v, (d as f32).to_bits());
+                            }
+                        }
+                        let p = dst + x * bpp;
+                        wrong[plane] += usize::from(actual[p..p + bpp] != oracle[at..at + bpp]);
+                        counts[plane] += 1;
+                    }
+                }
             }
+            if actual != expected {
+                failures.push((
+                    storage,
+                    wrong,
+                    actual.iter().zip(&expected).position(|(a, b)| a != b),
+                ));
+            }
+            eprintln!("PLANES format={storage} samples={counts:?} mismatches={wrong:?}");
+            assert_eq!(
+                host.log_messages(),
+                None,
+                "D3D12 validation for format {storage}"
+            );
             for object in [list, image, target] {
                 release(object);
             }
@@ -3130,7 +3238,7 @@ mod tests {
         release(queue);
         assert!(
             failures.is_empty(),
-            "(format, untouched buffer): {failures:?}"
+            "(format, plane mismatches, first byte): {failures:?}"
         );
     }
 
