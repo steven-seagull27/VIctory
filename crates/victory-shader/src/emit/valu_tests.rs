@@ -2620,3 +2620,46 @@ fn lane_mask_phi_whole_read_and_readlane_execute_correctly() {
         .collect();
     dispatch_wave32("per_lane_submask_whole_mask_and_readlane", &sub_shader, true, &sub_cases);
 }
+
+#[test]
+fn direct_select_uses_this_lanes_mask_bit() {
+    check_direct_lane_masks(|src| vop3(0x101, 1, 128, 129, src)); // v1 = mask[lane] ? 1 : 0
+}
+
+#[test]
+fn carry_in_uses_this_lanes_mask_bit() {
+    check_direct_lane_masks(|src| {
+        let mut add = vop3(0x128, 1, 128, 128, src); // v1 = 0 + 0 + mask[lane]
+        add[0] |= 12 << 8; // SDST = s12
+        add
+    });
+}
+
+fn check_direct_lane_masks(op: impl Fn(u16) -> [u32; 2]) {
+    let runtime_masks = [0, u32::MAX, 1, 0x8000_0000, 0xa5a5_5a5a];
+    for (name, prefix, source, fixed_wave, masks) in [
+        ("inline_zero", &[][..], 128, false, &[0][..]),
+        ("inline_ones", &[], 193, false, &[u32::MAX]),
+        ("inline_partial", &[], 143, true, &[15]),
+        (
+            "scalar_constant",
+            &[s_mov_b32(6, 143)],
+            sgpr(6),
+            true,
+            &[15],
+        ),
+        ("scalar_runtime", &[], sgpr(0), true, &runtime_masks),
+    ] {
+        let mut words = prefix.to_vec();
+        words.extend(op(source));
+        let shader = build_wave32_cs(&words);
+        let cases = masks
+            .iter()
+            .map(|&m| {
+                let want = (0..32).map(|lane| (m >> lane) & 1).collect();
+                ([m, 0, 0, 0], want)
+            })
+            .collect::<Vec<_>>();
+        dispatch_wave32(name, &shader, fixed_wave, &cases);
+    }
+}
