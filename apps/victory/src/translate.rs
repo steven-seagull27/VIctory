@@ -71,6 +71,8 @@ struct Tally {
     ms_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
+    vcc_baseline_hashes: HashSet<blake3::Hash>,
+    vcc_refusals: Vec<(blake3::Hash, &'static str)>,
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
@@ -134,6 +136,8 @@ impl Tally {
             *self.exports.entry(k).or_default() += n;
         }
         self.lines.extend(other.lines);
+        self.vcc_baseline_hashes.extend(other.vcc_baseline_hashes);
+        self.vcc_refusals.extend(other.vcc_refusals);
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
         }
@@ -144,12 +148,32 @@ impl Tally {
 type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
 /// The optional checks after emission, one set per thread.
-struct Checks {
+struct Checks<'a> {
+    /// Validated compute labels from the reference run's local --list output.
+    vcc_baseline: Option<&'a HashSet<String>>,
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+}
+
+fn vcc_baseline(path: &Path) -> Result<HashSet<String>> {
+    let text = std::fs::read_to_string(path)?;
+    let labels: HashSet<_> = text
+        .lines()
+        .filter_map(|line| {
+            line.trim_start_matches('\u{feff}')
+                .strip_suffix("  validated")
+        })
+        .filter(|label| label.ends_with(" Cs"))
+        .map(str::to_owned)
+        .collect();
+    anyhow::ensure!(
+        !labels.is_empty(),
+        "VCC baseline has no validated compute rows (expected UTF-8 output of translate --validate --list)"
+    );
+    Ok(labels)
 }
 
 pub fn run(
@@ -164,6 +188,9 @@ pub fn run(
         victory_core::ensure_outside_repo(Path::new(&dir))?;
     }
     let paths = crate::default_paths(paths)?;
+    let vcc_baseline = std::env::var_os("VICTORY_VCC_CENSUS")
+        .map(|path| vcc_baseline(Path::new(&path)))
+        .transpose()?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -210,6 +237,7 @@ pub fn run(
                                 ..Tally::default()
                             };
                             let mut checks = Checks {
+                                vcc_baseline: vcc_baseline.as_ref(),
                                 keep: (!pairs.is_empty()).then(|| kept.clone()),
                                 validator: validate
                                     .then(|| Validator::load(dll.as_deref()).ok())
@@ -310,6 +338,22 @@ pub fn run(
         println!("{l}");
     }
     let mut failed: Vec<_> = t.failed.into_iter().collect();
+    if let Some(labels) = vcc_baseline {
+        println!("VCC_CENSUS baseline-compute-labels {}", labels.len());
+        println!(
+            "VCC_CENSUS matched-unique-containers {}",
+            t.vcc_baseline_hashes.len()
+        );
+        let mut buckets = BTreeMap::new();
+        for (hash, bucket) in t.vcc_refusals {
+            if t.vcc_baseline_hashes.contains(&hash) {
+                *buckets.entry(bucket).or_insert(0usize) += 1;
+            }
+        }
+        for (bucket, n) in buckets {
+            println!("VCC_CENSUS {bucket} {n}");
+        }
+    }
     failed.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
@@ -498,7 +542,16 @@ fn translate(
     else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    let hash = blake3::hash(dxil);
+    // A previous parallel run may have listed another copy of this container.
+    // Match every alias, then join by the same part hash used to deduplicate.
+    if checks
+        .vcc_baseline
+        .is_some_and(|set| set.contains(&format!("{} Cs", example())))
+    {
+        t.vcc_baseline_hashes.insert(hash);
+    }
+    if !lock(seen).insert(hash) {
         t.duplicates += 1;
         return;
     }
@@ -506,6 +559,18 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    // The existing --list label has no ordinal within a stage. Such a label
+    // cannot tell which of multiple compute programs validated on the baseline.
+    let trace_vcc = checks.vcc_baseline.is_some()
+        && match programs.iter().filter(|p| p.stage == HwStage::Cs).count() {
+            0 => false,
+            1 => true,
+            _ => {
+                t.vcc_refusals
+                    .push((hash, "ambiguous-multi-compute-container"));
+                false
+            }
+        };
     for p in programs {
         t.programs += 1;
         match victory_shader::range::build_native(&p) {
@@ -569,7 +634,17 @@ fn translate(
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
                     let marks = emit::Options { view_marks: true };
-                    match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
+                    let translate = || emit::emit_with(&container, &p, &program, &s, &i, &r, marks);
+                    let result = if compute && trace_vcc {
+                        let (result, bucket) = emit::with_vcc_refusal_bucket(translate);
+                        if let Some(bucket) = bucket {
+                            t.vcc_refusals.push((hash, bucket));
+                        }
+                        result
+                    } else {
+                        translate()
+                    };
+                    match result {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);

@@ -1132,3 +1132,43 @@ fn pixel_vcc_fallback_preserves_a_dead_descriptor_field() {
         "{error:?}"
     );
 }
+
+#[test]
+fn vcc_census_describes_only_final_refusals() {
+    // All five wave32 programs write s16 at lane * 4 through the same UAV.
+    let prefix = [0xbe84_0300, 0xbe85_0380, 0xf408_0a02, 0xfa00_0040, 0x3420_0082, 0xbe90_038b];
+    let suffix = [0x7e06_0210, 0xbf8c_c07f, 0xe070_1000, 0x800a_0310, 0xbf81_0000];
+    let encode = |body: &[u32]| [&prefix[..], body, &suffix[..]].concat();
+    let direct = [
+        0xbeea_0380, 0x7da4_0080, 0xbf88_0002, 0x7e02_0300,
+        0xbeea_0381, 0xbefe_03c1, 0xbf87_0001, 0xbe90_0397,
+    ];
+    // The divergent join of literal 0/1 is in s12, copied into VCC afterwards.
+    let dependency = [
+        0xbe8c_0380, 0x7da4_0080, 0xbf88_0002, 0x7e02_0300,
+        0xbe8c_0381, 0xbefe_03c1, 0xbeea_030c, 0xbf87_0001, 0xbe90_0397,
+    ];
+    // Restore EXEC on the writing path, compare lane == 1, branch on VCC.
+    let producing_path = [
+        0x7da4_0080, 0xbf88_0004, 0xbefe_03c1, 0x7d84_0081,
+        0xbf87_0001, 0xbe90_0397, 0xbefe_03c1,
+    ];
+    let mut unrelated = producing_path;
+    unrelated[3] = 0x7da4_0081; // cmpx changes EXEC and leads to a different error
+    for (body, expected) in [
+        (&direct[..], Some("join/direct/immediate-moves")),
+        (&dependency[..], Some("join/dependency/immediate-moves")),
+        (&producing_path[..], Some("producing-path/compare")),
+        (&unrelated[..], None),
+    ] {
+        let words = encode(body);
+        let baseline = build(&words).expect_err("refused by default");
+        let (result, bucket) = super::with_vcc_refusal_bucket(|| build(&words));
+        assert_eq!(bucket, expected);
+        assert_eq!(result.expect_err("still refused"), baseline);
+    }
+    let accepted = encode(&[0xbeea_0381, 0xbf87_0001, 0xbe90_0397]);
+    let (result, bucket) = super::with_vcc_refusal_bucket(|| build(&accepted));
+    assert_eq!(bucket, None);
+    assert_eq!(result.unwrap().dxil, build(&accepted).unwrap().dxil);
+}

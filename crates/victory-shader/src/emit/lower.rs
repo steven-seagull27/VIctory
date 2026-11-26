@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+pub(super) mod vcc_census;
 
 type Why = &'static str;
 
@@ -2559,7 +2560,7 @@ impl<'a> Lower<'a> {
             })
             && st.bools.meet(&[(mask, true), (st.reach[block], false)])
         {
-            return Err("a scalar VCC branch with mask bits outside its producing path");
+            return Err(self.vcc_path_refusal(low));
         }
         self.mask_dword(v)
     }
@@ -2589,7 +2590,7 @@ impl<'a> Lower<'a> {
                             match atom {
                                 Atom::Uniform(scc) => values.push(scc),
                                 Atom::VccNonzero(low, high) => values.extend([low, high]),
-                                _ => return Err("a scalar VCC branch depending on a divergent scalar join"),
+                                _ => return Err(self.vcc_join_refusal(v, lo, hi, b, i)),
                             }
                         }
                     }
