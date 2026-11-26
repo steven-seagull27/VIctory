@@ -52,12 +52,18 @@ pub fn run(
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
+    if execute {
+        // Before the host's own memory (the image read below, the GPU
+        // device, the caches) takes the space the title's 32-bit memory needs.
+        victory_hle::modules::xmem::low_guards::install();
+    }
     let cfg = victory_core::Config::load()?;
     // Before the import registry is first used: it holds the module only
     // when the host's FidelityFX serves.
     victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
-    let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let prepared = victory_loader::prepare(
+        &std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?,
+    )?;
     let hash = prepared.original_hash.to_hex();
     let title_dir = exe.parent().unwrap_or(Path::new("."));
     match victory_game::identify(&hash) {
@@ -73,6 +79,8 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    // Mapped: the patched bytes (the exe's size, 114 MB) are not needed.
+    drop(prepared);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(

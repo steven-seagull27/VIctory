@@ -2,6 +2,7 @@
 //! tests, drawing a full-screen triangle and reading the target back.
 
 use std::ffi::CString;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -15,6 +16,7 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     pub device: ID3D12Device,
+    warp: bool,
 }
 
 /// What the stage declares that a pipeline must match.
@@ -62,6 +64,67 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// A D3D12 device kept alive for the process so concurrent callers do not
+/// race creating and tearing down the same singleton adapter device.
+struct SharedDevice(ID3D12Device);
+
+// SAFETY: `ID3D12Device` is free-threaded; cloning increments its COM
+// reference count.
+unsafe impl Send for SharedDevice {}
+// SAFETY: as above.
+unsafe impl Sync for SharedDevice {}
+
+fn create_device(warp: bool) -> Result<ID3D12Device, String> {
+    // SAFETY: plain D3D12/DXGI calls with valid out pointers.
+    unsafe {
+        let mut device: Option<ID3D12Device> = None;
+        let factory: IDXGIFactory4 =
+            CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+        let adapter: IDXGIAdapter1 = if warp {
+            factory.EnumWarpAdapter().map_err(err)?
+        } else {
+            hardware_adapter(&factory).map_err(err)?
+        };
+        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+        let device = device.ok_or("no device")?;
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+            .map_err(err)?;
+        if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+            return Err(format!(
+                "the device supports SM {:#x} only",
+                sm.HighestShaderModel.0
+            ));
+        }
+        Ok(device)
+    }
+}
+
+/// Whether `device` runs on a software adapter (WARP); `true` when that
+/// cannot be told, so its work is serialised rather than raced.
+fn on_software_adapter(device: &ID3D12Device) -> bool {
+    // SAFETY: plain D3D12/DXGI queries with valid pointers.
+    unsafe {
+        let luid = device.GetAdapterLuid();
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return true;
+        };
+        let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) else {
+            return true;
+        };
+        adapter
+            .GetDesc1()
+            .map_or(true, |d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+    }
+}
+
 /// The first adapter that is a GPU: not flagged software, and with video
 /// memory of its own. A machine without one (GitHub's Windows runner has only
 /// `Microsoft Basic Render Driver`) has nothing to run the hardware-only
@@ -91,42 +154,46 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
     ))
 }
 
+/// Serializes WARP (`d3d10warp.dll`) operations across threads: concurrent
+/// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
+static WARP_LOCK: Mutex<()> = Mutex::new(());
+
 impl Host {
+    fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
+        self.warp
+            .then(|| WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     /// A software default adapter (a machine without a GPU, as CI) is
     /// refused, so hardware-only checks never run on WARP.
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-        // SAFETY: plain D3D12/DXGI calls with valid out pointers.
-        unsafe {
-            let mut device: Option<ID3D12Device> = None;
-            let factory: IDXGIFactory4 =
-                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-            let adapter: IDXGIAdapter1 = if warp {
-                factory.EnumWarpAdapter().map_err(err)?
-            } else {
-                hardware_adapter(&factory).map_err(err)?
-            };
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            let device = device.ok_or("no device")?;
-            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
-            };
-            device
-                .CheckFeatureSupport(
-                    D3D12_FEATURE_SHADER_MODEL,
-                    (&raw mut sm).cast(),
-                    size_of_val(&sm) as u32,
-                )
-                .map_err(err)?;
-            if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-                return Err(format!(
-                    "the device supports SM {:#x} only",
-                    sm.HighestShaderModel.0
-                ));
-            }
-            Ok(Host { device })
+        if warp {
+            static WARP: OnceLock<Result<SharedDevice, String>> = OnceLock::new();
+            let shared = WARP.get_or_init(|| {
+                let _guard = WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                create_device(true).map(SharedDevice)
+            });
+            return shared
+                .as_ref()
+                .map(|d| Host {
+                    device: d.0.clone(),
+                    warp: true,
+                })
+                .map_err(Clone::clone);
         }
+        Ok(Host {
+            device: create_device(false)?,
+            warp: false,
+        })
+    }
+
+    /// A host on a device made elsewhere (the GPU crate's). Its work is
+    /// serialised as WARP's is when the device runs on a software adapter.
+    pub fn from_device(device: ID3D12Device) -> Self {
+        let warp = on_software_adapter(&device);
+        Host { device, warp }
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -258,18 +325,26 @@ impl Host {
             },
         };
         // SAFETY: the description points at live arrays.
-        unsafe {
+        let blob: ID3DBlob = unsafe {
             let mut blob = None;
             let mut error = None;
             D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error))
                 .map_err(err)?;
-            let blob: ID3DBlob = blob.ok_or("no root signature blob")?;
-            let bytes = std::slice::from_raw_parts(
-                blob.GetBufferPointer().cast::<u8>(),
-                blob.GetBufferSize(),
-            );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
-        }
+            blob.ok_or("no root signature blob")?
+        };
+        // SAFETY: `blob` stays alive for the lifetime of `bytes`.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        };
+        self.root_signature_bytes(bytes)
+    }
+
+    /// Creates a root signature from serialized root signature bytes (or a
+    /// DXIL container carrying one).
+    pub fn root_signature_bytes(&self, bytes: &[u8]) -> Result<ID3D12RootSignature, String> {
+        let _guard = self.lock_warp();
+        // SAFETY: `bytes` is a live slice of root-signature or container bytes.
+        unsafe { self.device.CreateRootSignature(0, bytes) }.map_err(err)
     }
 
     /// A compute pipeline; user data is root parameter 0.
@@ -296,6 +371,7 @@ impl Host {
             },
             ..Default::default()
         };
+        let _guard = self.lock_warp();
         // SAFETY: the description points at live data.
         unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(err)
     }
@@ -402,6 +478,7 @@ impl Host {
             desc.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
             desc.DepthStencilState.StencilEnable = true.into();
         }
+        let _guard = self.lock_warp();
         // SAFETY: the description points at live data.
         let pso = unsafe { self.device.CreateGraphicsPipelineState(&desc) };
         pso.map_err(err)
@@ -512,6 +589,7 @@ impl Host {
             SizeInBytes: size_of::<Stream>(),
             pPipelineStateSubobjectStream: (&raw mut stream).cast(),
         };
+        let _guard = self.lock_warp();
         let device: ID3D12Device2 = self.device.cast().map_err(err)?;
         // SAFETY: the stream points at live data and outlives the call.
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
@@ -526,6 +604,8 @@ impl Host {
     pub fn fuses_fmad(&self) -> Result<bool, String> {
         let shader = fmad_probe().map_err(|e| e.to_string())?;
         let (root, pso) = self.compute_pipeline(&shader)?;
+        // Taken after the pipeline, which takes it itself.
+        let _guard = self.lock_warp();
         let operands = [0x3F7F_FFFF, 0x3F80_0001, 0xBF80_0000];
         let mut user_data = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
@@ -881,6 +961,7 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
+        let _guard = self.lock_warp();
         let dev = &self.device;
         let (w, h) = d.size;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -1239,6 +1320,9 @@ pub enum View<'a> {
     Uint2TextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// A typed buffer UAV in this format, of this many elements of this many
+    /// bytes, zeroed.
+    TypedUav(DXGI_FORMAT, u32, u32),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1255,6 +1339,34 @@ pub enum View<'a> {
     /// host's null raw buffer SRV at [`super::NULL_BUFFER_VIEW`] and UAV
     /// below it.
     NullBuffers,
+}
+
+/// The host's view-stride table (`t`[`super::VIEW_STRIDES`]) for a view
+/// heap of `views`, as `victory_gpu` fills it: per slot the element size of
+/// a buffer view (4 for raw ones), with [`super::VIEW_INTEGER`] (and
+/// [`super::VIEW_SIGNED`]) for typed views of integer formats; 0 elsewhere.
+#[cfg(test)]
+pub fn view_strides(views: &[View]) -> Vec<u32> {
+    let kind = |f: DXGI_FORMAT| match f {
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R32G32_UINT
+        | DXGI_FORMAT_R10G10B10A2_UINT | DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R16G16_UINT
+        | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R8_UINT => super::VIEW_INTEGER,
+        DXGI_FORMAT_R32G32B32A32_SINT | DXGI_FORMAT_R16G16B16A16_SINT | DXGI_FORMAT_R32G32_SINT
+        | DXGI_FORMAT_R8G8B8A8_SINT | DXGI_FORMAT_R16G16_SINT | DXGI_FORMAT_R32_SINT
+        | DXGI_FORMAT_R8G8_SINT | DXGI_FORMAT_R16_SINT | DXGI_FORMAT_R8_SINT => super::VIEW_INTEGER | super::VIEW_SIGNED,
+        _ => 0,
+    };
+    views
+        .iter()
+        .map(|v| match *v {
+            View::Buffer { stride: Stride::Raw, .. } | View::RawUav(_) => 4,
+            View::Buffer { stride: Stride::Typed, .. } => 16,
+            View::Buffer { stride: Stride::Structured(n), .. } => n,
+            View::Buffer { stride: Stride::Format(f, n), .. } | View::TypedUav(f, _, n) => n | kind(f),
+            View::HalfUav(_) => 8,
+            _ => 0,
+        })
+        .collect()
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1290,6 +1402,7 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
+        let _guard = self.lock_warp();
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
@@ -1401,6 +1514,32 @@ impl Host {
                 std::ptr::copy_nonoverlapping(data.as_ptr(), p.cast::<u32>(), data.len());
                 b.Unmap(0, None);
                 Ok(b)
+            };
+            // Zeros a UAV made as a copy destination (`size`: a texture's,
+            // `n` its words per texel, else a buffer's dwords) and returns
+            // the upload buffer to keep. A new committed resource is not
+            // always zeroed: WARP hands out memory a freed buffer of ours held.
+            let zero = |r: &ID3D12Resource, size: Option<(u32, u32)>, n: u32| {
+                let zeros = match size {
+                    Some((w, h)) => {
+                        let pitch = (w * 4 * n).next_multiple_of(256);
+                        let zeros = upload(&vec![0; (pitch * h / 4) as usize])?;
+                        let from = footprint_as(&zeros, w, h, n);
+                        list.CopyTextureRegion(&subresource(r), 0, 0, 0, &from, None);
+                        zeros
+                    }
+                    None => {
+                        let zeros = upload(&vec![0; n as usize])?;
+                        list.CopyBufferRegion(r, 0, &zeros, 0, u64::from(n) * 4);
+                        zeros
+                    }
+                };
+                list.ResourceBarrier(&[transition(
+                    r,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+                Ok::<_, String>(zeros)
             };
             let slots = match d.views.last() {
                 Some(View::NullBuffers) => super::HEAP_VIEWS as usize,
@@ -1543,7 +1682,7 @@ impl Host {
                         dev.CreateShaderResourceView(&tex, None, at);
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::HalfUav(_) | View::TypedUav(..) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1552,6 +1691,9 @@ impl Host {
                                 e,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
+                            View::TypedUav(format, e, bytes) => {
+                                ((e * bytes).div_ceil(4), format, e, D3D12_BUFFER_UAV_FLAG_NONE)
+                            }
                             View::RawUav(n) => {
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
@@ -1561,7 +1703,7 @@ impl Host {
                         let b = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
                             Format: format,
@@ -1575,6 +1717,7 @@ impl Host {
                             },
                         };
                         dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        keep.push(zero(&b, None, n)?);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
@@ -1586,9 +1729,10 @@ impl Host {
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &texture(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         dev.CreateUnorderedAccessView(&t, None, None, at);
+                        keep.push(zero(&t, Some((w, h)), 4)?);
                         let pitch = (w * 16).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
@@ -1605,9 +1749,10 @@ impl Host {
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &texture_as(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, format),
-                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         dev.CreateUnorderedAccessView(&t, None, None, at);
+                        keep.push(zero(&t, Some((w, h)), words)?);
                         let pitch = (w * 4 * words).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
@@ -1805,9 +1950,10 @@ impl Host {
                         let b = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
+                        keep.push(zero(&b, None, n)?);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
@@ -1820,7 +1966,6 @@ impl Host {
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);
             for (r, size, n, rb) in &uavs {
-                // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
                     r,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -1874,5 +2019,56 @@ impl Host {
             drop(keep);
             Ok(out)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Barrier;
+
+    use super::*;
+
+    /// Regression test for concurrent WARP device creation, pipeline
+    /// compilation, and draws across threads (issue #181).
+    #[test]
+    fn parallel_warp_pipelines_and_draws() {
+        let Ok(first) = Host::new(true) else {
+            eprintln!("no SM 6.6 warp device; skipped");
+            return;
+        };
+        let second = Host::new(true).expect("second WARP Host::new");
+        assert_eq!(first.device, second.device, "WARP device should be shared");
+
+        let ps = stub_ps();
+        let vs = stub_vs(&ps).expect("stub_vs");
+        let threads = 8;
+        let barrier = Barrier::new(threads);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..4 {
+                        let host = Host::new(true).expect("WARP Host::new");
+                        let (root, pso) = host.pipeline(&vs, &ps).expect("WARP pipeline");
+                        let out = host
+                            .draw(
+                                &root,
+                                &pso,
+                                &Draw {
+                                    roots: Vec::new(),
+                                    textures: &[],
+                                    samplers: &[],
+                                    vertices: &[],
+                                    stride: 0,
+                                    size: (4, 4),
+                                    mesh_groups: 0,
+                                },
+                            )
+                            .expect("WARP draw");
+                        assert_eq!(out.len(), 16);
+                    }
+                });
+            }
+        });
     }
 }
