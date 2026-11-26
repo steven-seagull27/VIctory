@@ -531,6 +531,16 @@ impl Tracked {
         (copy, zero)
     }
 
+    /// Marks the runs returned by a previous take as still needing a copy.
+    /// Used when the consumer could not reserve its staging space.
+    pub(crate) fn retry_taken(&self, runs: &[(usize, usize)]) {
+        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+        for &(start, end) in runs {
+            changed.extend(start / PAGE..end.div_ceil(PAGE));
+        }
+        set_dirty(self.changed.2, !changed.is_empty());
+    }
+
     /// Whether page `page` (a page number) changed since it was taken.
     pub(crate) fn changed(&self, page: usize) -> bool {
         self.changed

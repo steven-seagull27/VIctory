@@ -182,10 +182,12 @@ const CHUNK: u64 = 32 << 20;
 /// Chunks kept between submissions (more are made while one needs them).
 const CHUNKS_KEPT: usize = 16;
 
+type UploadSpace = (ID3D12Resource, u64, *mut u8);
+
 /// `size` bytes of staging space: a buffer, the offset of the space in it
 /// (a multiple of 512, as texture copies need) and its mapping there.
 /// Space larger than a chunk is a buffer of its own ([`staging_buffer`]).
-fn staging_space(size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+fn staging_space(size: u64) -> Option<UploadSpace> {
     if size > CHUNK {
         return staging_buffer(size).map(|(b, data)| (b, 0, data));
     }
@@ -543,7 +545,7 @@ impl Staging {
     pub(crate) fn refresh(&self) -> Option<Upload> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let (read, buffer) = self.refresh_now();
+        let (read, buffer) = self.refresh_now(staging_space);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -552,7 +554,7 @@ impl Staging {
 
     /// Returns the bytes of title memory read, and the buffer it detiled
     /// into with the subresources detiled.
-    fn refresh_now(&self) -> (usize, Option<Upload>) {
+    fn refresh_now(&self, allocate: impl FnOnce(u64) -> Option<UploadSpace>) -> (usize, Option<Upload>) {
         let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
         let size = self.layout.size as usize;
         let start = self.memory as usize;
@@ -618,7 +620,13 @@ impl Staging {
             if fresh.is_empty() {
                 return (bytes, None);
             }
-            let buffer = self.detile(read, &fresh);
+            let buffer = self.detile(read, &fresh, |size| {
+                let space = allocate(size);
+                if space.is_none() {
+                    t.retry_taken(&ranges);
+                }
+                space
+            });
             if buffer.is_none() {
                 for &i in &fresh {
                     last.hashes[i as usize] = None;
@@ -643,7 +651,7 @@ impl Staging {
             }
             let zeros = vec![0u8; size];
             let every = all();
-            let buffer = self.detile(&zeros, &every);
+            let buffer = self.detile(&zeros, &every, allocate);
             last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
             return (0, buffer.map(|(b, at)| (b, at, every)));
         }
@@ -656,7 +664,7 @@ impl Staging {
             return (size, None);
         }
         let every = all();
-        let buffer = self.detile(tiled, &every);
+        let buffer = self.detile(tiled, &every, allocate);
         last.hash = buffer.is_some().then_some(hash);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -666,7 +674,12 @@ impl Staging {
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
     /// staging buffer (`None` if none could be had or a subresource could
     /// not be read).
-    fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
+    fn detile(
+        &self,
+        tiled: &[u8],
+        subresources: &[u32],
+        allocate: impl FnOnce(u64) -> Option<UploadSpace>,
+    ) -> Option<(ID3D12Resource, u64)> {
         let packed = || packed_subresources(&self.footprints, self.size, subresources);
         let size = if subresources.len() == self.footprints.len() {
             self.size
@@ -674,7 +687,7 @@ impl Staging {
             let (_, offset, len) = packed().last()?;
             offset + len
         };
-        let (buffer, at, data) = staging_space(size)?;
+        let (buffer, at, data) = allocate(size)?;
         #[cfg(feature = "diagnostics")]
         // Scanned only when its message is wanted: a pass over every
         // texture read, in timing runs too.
@@ -886,6 +899,87 @@ mod tests {
             spans(&[0, 1, 2]),
             [(0, 0, 1024), (1, 1024, 1024), (2, 2048, 784)]
         );
+    }
+
+    #[test]
+    fn tracked_texture_retries_after_staging_allocation_fails() {
+        use crate::object::{S_OK, This, slot};
+        const PIXEL: u32 = 0xff4d_250d;
+        let Some(host) = host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        let address = crate::watch::tests::pool(1);
+        #[repr(align(8))]
+        struct TextureWords([u32; 14]);
+        // 4x4 RGBA8, one mip, linear title memory, sampled only.
+        let desc = TextureWords([3, 0, 0, 0, 4, 0, 4, 1 | 1 << 16, 28, 1, 0, 1, 0, 0]);
+        let iid = crate::object::guid(
+            0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut resource = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_at_address(
+                std::ptr::null(),
+                address as u64,
+                desc.0.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &iid,
+                &mut resource,
+            ),
+            S_OK,
+        );
+        let copy = crate::resource::host_copy(resource).unwrap();
+        let staging = staging(resource, &copy.texture).unwrap();
+        assert!(staging.tracked.is_some(), "the source must take the tracked branch");
+        for y in 0..4 {
+            for x in 0..4 {
+                let offset = staging.layout.offset(0, x, y, 0).unwrap() as usize;
+                // SAFETY: a texel in a fresh page of our linear texture.
+                unsafe { ((address + offset) as *mut u32).write_unaligned(PIXEL) };
+            }
+        }
+        let mut allocation_call_count = 0;
+        let (_, first) = staging.refresh_now(|_| {
+            allocation_call_count += 1;
+            None
+        });
+        let dirty_after_refusal = staging.maybe_changed();
+        let (_, retried) =
+            staging.refresh_now(|size| host.upload_buffer(size).map(|(b, data)| (b, 0, data)));
+        let texels = retried.map(|(buffer, offset, subresources)| {
+            assert_eq!(subresources, [0]);
+            let mut mapped = std::ptr::null_mut();
+            let pitch = staging.footprints[0].Footprint.RowPitch as usize;
+            // SAFETY: each row and texel is inside the live upload buffer.
+            unsafe {
+                buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                let base = mapped.cast::<u8>().add(offset as usize);
+                let texels: Vec<_> = (0..4)
+                    .flat_map(|y| {
+                        (0..4).map(move |x| base.add(y * pitch + x * 4).cast::<u32>().read_unaligned())
+                    })
+                    .collect();
+                buffer.Unmap(0, None);
+                texels
+            }
+        });
+        let clean_after_retry = !staging.maybe_changed();
+        let (_, next) = staging.refresh_now(|_| panic!("an unchanged texture needs no staging"));
+        drop((staging, copy));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource), 0);
+        crate::watch::tests::free(address);
+
+        assert_eq!(allocation_call_count, 1);
+        assert!(first.is_none());
+        eprintln!(
+            "dirty after refusal={dirty_after_refusal}, recovered texels={}",
+            texels.as_ref().map_or(0, Vec::len)
+        );
+        assert!(dirty_after_refusal);
+        assert_eq!(texels, Some(vec![PIXEL; 16]));
+        assert!(clean_after_retry && next.is_none());
     }
 
     #[test]
