@@ -85,6 +85,11 @@ fn check_rows(address: usize, mixed: bool) {
         fill(0, 0x99);
         submit([0x99, 0x33, 0x33], 1);
         submit([0x99, 0x33, 0x33], 0);
+        // The same mip has changed ordinary and tracked rows before one submit.
+        fill(0, 0x55);
+        fill(1, 0x77);
+        submit([0x55, 0x77, 0x33], 1);
+        submit([0x55, 0x77, 0x33], 0);
     } else {
         fill(0, 0x66);
         crate::texture::tests::defer_one_upload(&staging);
