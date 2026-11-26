@@ -283,7 +283,7 @@ static QUEUES: (Mutex<Queues>, Condvar) = (
 
 /// The queue of a pipeline a draw waits for (`now`) or started early.
 fn queue_index(p: &Pending, now: bool) -> usize {
-    usize::from(p.graphics.is_none()) + if now { 0 } else { 2 }
+    usize::from(super::compute_shader(&p.shaders).is_some()) + if now { 0 } else { 2 }
 }
 
 /// The pipeline workers (half the logical processors, 2 to 8), started on
@@ -292,11 +292,10 @@ static WORKERS: OnceLock<usize> = OnceLock::new();
 
 /// Takes the next pipeline for a worker, if one may be taken now, and
 /// whether it is a compute one (counted in `compute_busy`).
-fn next(queues: &mut Queues) -> Option<(Arc<Pending>, bool)> {
+fn next(queues: &mut Queues, workers: usize) -> Option<(Arc<Pending>, bool)> {
     // With one worker only, compute has to take it (else nothing compute is
     // ever made).
-    let workers = WORKERS.get().copied().unwrap_or(1).max(2);
-    let compute_free = queues.compute_busy + 1 < workers;
+    let compute_free = queues.compute_busy < workers.saturating_sub(1).max(1);
     for (i, q) in queues.queues.iter_mut().enumerate() {
         let compute = i % 2 == 1;
         if compute && !compute_free {
@@ -372,7 +371,7 @@ fn work() {
         let (p, compute) = {
             let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(next) = next(&mut queues) {
+                if let Some(next) = next(&mut queues, WORKERS.get().copied().unwrap_or(1)) {
                     break next;
                 }
                 let (held, waited) = work
@@ -386,19 +385,12 @@ fn work() {
                 }
             }
         };
-        let taken = p.taken.swap(true, Ordering::Relaxed);
-        if !taken {
-            let _slot = ComputeSlot(compute);
-            p.make();
+        let slot = ComputeSlot(compute);
+        if p.taken.swap(true, Ordering::Relaxed) {
+            continue; // A promotion left this second entry. Return its slot.
         }
-        if compute {
-            // Given back by the slot above; a worker that found no compute
-            // to take is woken there.
-            continue;
-        }
-        if taken {
-            continue; // its other queue entry
-        }
+        p.make();
+        drop(slot);
         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
             drained();
         } else {
@@ -433,26 +425,37 @@ mod tests {
     /// taking the last worker.
     #[test]
     fn graphics_go_first_and_compute_leaves_a_worker() {
-        // Two workers: one compute at a time, so one is always free.
-        WORKERS.get_or_init(|| 2);
-        let compute = |key: &str| {
-            let mut p = Pending::new(Vec::new(), None);
-            p.key = key.to_owned();
-            Arc::new(p)
+        let pending = |stage, graphics| {
+            Arc::new(Pending::new(
+                vec![Arc::new(Shader::new(stage, &[]))],
+                graphics,
+                #[cfg(feature = "diagnostics")]
+                &[],
+            ))
         };
+        let graphics = pending("vertex", Some(Box::default()));
+        let early_graphics = pending("vertex", Some(Box::default()));
+        let compute = pending("compute", None);
+        let compute_stream = pending("compute", Some(Box::default()));
+        assert_eq!(queue_index(&compute_stream, true), 1);
+        assert_eq!(queue_index(&compute_stream, false), 3);
         let mut queues = Queues::default();
-        queues.queues[3].push_back(compute("early compute"));
-        queues.queues[2].push_back(compute("early graphics"));
-        queues.queues[0].push_back(compute("graphics a draw waits for"));
-        // A compute pipeline a dispatch waits for and one started early.
-        queues.queues[1].push_back(compute("compute a dispatch waits for"));
-        assert_eq!(queue_index(&compute("c"), true), 1);
-        assert_eq!(queue_index(&compute("c"), false), 3);
-        // Graphics first, then compute, then the early starts.
-        let taken: Vec<String> = std::iter::from_fn(|| next(&mut queues))
-            .map(|(p, _)| p.key.clone())
-            .collect();
-        assert_eq!(taken, ["graphics a draw waits for", "compute a dispatch waits for", "early graphics", "early compute"]);
+        for (p, now) in [
+            (&compute_stream, false),
+            (&early_graphics, false),
+            (&compute, true),
+            (&graphics, true),
+        ] {
+            queues.queues[queue_index(p, now)].push_back(p.clone());
+        }
+        // The waiting graphics and compute, then early graphics even while compute is busy.
+        for expected in [&graphics, &compute, &early_graphics] {
+            assert!(Arc::ptr_eq(&next(&mut queues, 2).unwrap().0, expected));
+        }
+        assert_eq!(queues.compute_busy, 1);
+        assert!(next(&mut queues, 2).is_none());
+        queues.compute_busy -= 1; // the first compute compile completed
+        assert!(Arc::ptr_eq(&next(&mut queues, 1).unwrap().0, &compute_stream));
     }
 
     /// An early start is queued once; a draw waiting for it puts it ahead,

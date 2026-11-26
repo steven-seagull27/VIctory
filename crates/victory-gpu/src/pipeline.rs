@@ -87,6 +87,14 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .clone()
 }
 
+#[cfg(windows)]
+fn compute_shader(shaders: &[Arc<Shader>]) -> Option<&Arc<Shader>> {
+    match shaders {
+        [cs] if cs.stage == "compute" => Some(cs),
+        _ => None,
+    }
+}
+
 impl Shader {
     fn new(stage: &'static str, bytes: &[u8]) -> Shader {
         Shader {
