@@ -2294,8 +2294,9 @@ mod tests {
             (heap, writer, alias, dst_tex, out_buf, list)
         };
 
-        // Run each copy path against its own independent aliased pair so none
-        // can mask another via `alias_copy`'s per-list `first_use` guard.
+        // Use an independent pair per path. Within each list, read the alias,
+        // write a new colour to its source, then read it again before submitting.
+        let mut wrong_words = 0;
         for (mode, color) in [
             ("copy_resource", [1.0f32, 2.0, 3.0, 4.0]),
             ("copy_texture_region", [5.0f32, 6.0, 7.0, 8.0]),
@@ -2309,21 +2310,24 @@ mod tests {
             let mut rtv_mem = [0u64; 16];
             let rtv = rtv_mem.as_mut_ptr() as u64;
             crate::descriptor::create_rtv(null, writer, null.cast(), rtv);
-            clear_rtv(list, rtv, &color, 0, null.cast());
-
-            match mode {
-                "copy_resource" => {
-                    copy_resource(list, dst_tex, alias);
-                    copy_texture_region(list, &fp(out_buf), 0, 0, 0, &sub(dst_tex), null.cast());
-                }
-                "copy_texture_region" => {
-                    copy_texture_region(list, &sub(dst_tex), 0, 0, 0, &sub(alias), null.cast());
-                    copy_texture_region(list, &fp(out_buf), 0, 0, 0, &sub(dst_tex), null.cast());
-                }
-                "read_back" => {
-                    copy_texture_region(list, &fp(out_buf), 0, 0, 0, &sub(alias), null.cast());
-                }
-                _ => unreachable!(),
+            let colors = [color, color.map(|value| value + 32.0)];
+            for (pass, value) in colors.iter().enumerate() {
+                clear_rtv(list, rtv, value, 0, null.cast());
+                let mut out = fp(out_buf);
+                out.footprint.offset = (pass * 1024) as u64;
+                let source = match mode {
+                    "copy_resource" => {
+                        copy_resource(list, dst_tex, alias);
+                        dst_tex
+                    }
+                    "copy_texture_region" => {
+                        copy_texture_region(list, &sub(dst_tex), 0, 0, 0, &sub(alias), null.cast());
+                        dst_tex
+                    }
+                    "read_back" => alias,
+                    _ => unreachable!(),
+                };
+                copy_texture_region(list, &out, 0, 0, 0, &sub(source), null.cast());
             }
             close(list);
             execute(queue, 1, &list);
@@ -2331,14 +2335,22 @@ mod tests {
 
             // SAFETY: `out_buf` holds 4096 bytes and the submission has completed.
             let got = unsafe { std::slice::from_raw_parts(out_ptr, 4096) };
-            let want = expected_row(color);
-            for row in 0..4 {
-                let at = row * 256;
-                assert_eq!(
-                    &got[at..at + 64],
-                    want.as_slice(),
-                    "{mode}: row {row} must match GPU-written alias source"
-                );
+            for (pass, value) in colors.into_iter().enumerate() {
+                let want = expected_row(value);
+                let previous = expected_row(color);
+                let expected_words = want.as_chunks::<4>().0;
+                let previous_words = previous.as_chunks::<4>().0;
+                let mut matching = 0;
+                let mut matching_first = 0;
+                for row in 0..4 {
+                    let at = pass * 1024 + row * 256;
+                    for (i, &word) in got[at..at + 64].as_chunks::<4>().0.iter().enumerate() {
+                        matching += usize::from(word == expected_words[i]);
+                        matching_first += usize::from(word == previous_words[i]);
+                    }
+                }
+                eprintln!("{mode} pass {pass}: {matching}/64 expected, {matching_first}/64 match first colour");
+                wrong_words += 64 - matching;
             }
 
             for object in [list, out_buf, dst_tex, alias, writer, heap] {
@@ -2397,5 +2409,6 @@ mod tests {
         ] {
             assert_eq!(release(object), 0);
         }
+        assert_eq!(wrong_words, 0, "same-list alias-copy readbacks");
     }
 }
