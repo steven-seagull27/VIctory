@@ -2281,3 +2281,25 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+#[test]
+fn signed_mad_carry_is_bit_64_of_the_exact_sum() {
+    let mut mad = vop3(0x177, 5, vgpr(1), vgpr(2), vgpr(3));
+    mad[0] |= 12 << 8; // SDST = s12
+    let mask = vop3(0x101, 0, 128, 129, sgpr(12)); // v0 = s12[lane] ? 1 : 0
+    let shader = build_valu_cs(&[mad, mask].concat());
+    let cases: [(i32, i32, i64); 6] = [
+        (-3, 5, 0),        // negative and representable
+        (1, 1, i64::MAX),  // positive exact result beyond i64::MAX
+        (-3, 5, 25),       // opposite signs, positive result
+        (-3, 5, i64::MIN), // negative exact result below i64::MIN
+        (i32::MIN, i32::MIN, i64::MAX),
+        (i32::MIN, i32::MAX, i64::MIN),
+    ];
+    let inputs = cases.map(|(a, b, c)| [a as u32, b as u32, c as u32, (c >> 32) as u32]);
+    run_cases(&shader, &inputs, |adapter, i, _, got| {
+        let (a, b, c) = cases[i];
+        let wide = i128::from(a) * i128::from(b) + i128::from(c);
+        assert_eq!(got, ((wide >> 64) & 1) as u32, "{adapter}: {a} * {b} + {c}");
+    });
+}
