@@ -64,9 +64,7 @@ fn adjacent_buffer_descriptors_report_their_fields_after_a_rewrite() {
 
     let shader = descriptor_reader();
     assert!(shader.view_addresses && shader.root_srvs.is_empty() && !shader.memory);
-    let host = victory_shader::emit::host::Host {
-        device: device.device.clone(),
-    };
+    let host = victory_shader::emit::host::Host::from_device(device.device.clone());
     let (root, pso) = host.compute_pipeline(&shader).unwrap();
     let mirror = guest_heap.host().expect("host view heap");
     let addresses = mirror.view_addresses().expect("view-address table");

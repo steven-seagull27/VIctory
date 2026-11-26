@@ -308,6 +308,17 @@ impl Module {
         }
     }
 
+    #[cfg(test)]
+    pub fn has_function(&self, name: &str) -> bool {
+        self.func_ids.contains_key(name)
+    }
+
+    #[cfg(test)]
+    pub fn has_i32_const(&self, v: u32) -> bool {
+        let want = Const::Int(i64::from(v as i32));
+        self.consts.iter().any(|(_, c)| *c == want)
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {
