@@ -92,6 +92,9 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod timestamp_readback;
+
 #[cfg(test)]
 mod tests {
     use super::*;

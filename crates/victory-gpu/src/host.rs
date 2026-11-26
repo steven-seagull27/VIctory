@@ -1126,9 +1126,9 @@ impl Host {
     #[cfg(windows)]
     pub(crate) fn query_heap(&self, kind: u32, count: u32) -> Option<ID3D12QueryHeap> {
         let r#type = match kind {
-            0 | 1 => D3D12_QUERY_HEAP_TYPE_OCCLUSION,
-            2 => D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
-            3 => D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
+            0 => D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+            1 => D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+            2 => D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
             _ => return None,
         };
         let mut heap: Option<ID3D12QueryHeap> = None;
