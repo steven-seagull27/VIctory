@@ -1050,6 +1050,29 @@ fn vcc_branch_program(op: u32, lo: u32, hi: u32) -> Vec<u32> {
     ]
 }
 
+#[test]
+fn vcc_branch_refuses_a_lane_local_scalar_source() {
+    for (low, high) in [(0xbeea_030c, 0xbeeb_0380), (0xbeea_0380, 0xbeeb_030c)] {
+        let mut words = vcc_branch_program(7, 0x80, 0x80);
+        words[3] = 0xfa00_0040; // build_wave's UAV is at table dword 16
+        words.splice(6..8, [
+            0xbe8c_0380, // s12 = 0
+            0x7da4_0081, // EXEC = lane 1
+            0xbf88_0001, // s_cbranch_execz skips the scalar write only if EXEC is empty
+            0xbe8c_0381, // s12 = 1 for the wave
+            0xbefe_04c1, // restore EXEC
+            low, high, // place s12 in just one VCC word
+        ]);
+        assert!(matches!(
+            build_wave(&words, true),
+            Err(crate::ShaderError::Unsupported {
+                what: "a scalar VCC branch depending on a divergent scalar join",
+                ..
+            })
+        ));
+    }
+}
+
 /// `s_cbranch_vccz` and `s_cbranch_vccnz` test VCC as a whole (RDNA2 ISA,
 /// 12.5: one decision for the wave), also when only its high dword holds a
 /// bit and VCC was written by halves: every lane takes the same path.

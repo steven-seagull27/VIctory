@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod scalar_vcc;
 
 type Why = &'static str;
 
@@ -2617,6 +2618,7 @@ impl<'a> Lower<'a> {
             Atom::Constant(_) => Err("a constant lane mask"),
             // The pair as a whole is not zero: one value for the wave.
             Atom::Nonzero(lo, hi) => {
+                self.check_scalar_vcc_joins(lo, hi)?;
                 let word = |w: Val| match w {
                     Val::I32(x) => Ok(x),
                     _ => Err("an opaque lane mask"),
