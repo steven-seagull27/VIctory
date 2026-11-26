@@ -6133,13 +6133,16 @@ impl<'a> Lower<'a> {
                 self.s.flags |= flags::FLOAT64 | flags::INT64;
                 // A literal source is the *high* word of the binary64 (RDNA 2
                 // ISA 6.2.1): the low word is zero. A register pair comes
-                // through `src64` as the integer its bits are.
+                // through `src64_operand` as the integer its bits are.
                 let Fields::Valu(v) = &inst.fields else {
                     return Err("a 64-bit source");
                 };
+                if v.sdwa.is_some() || v.dpp.is_some() {
+                    return Err("64-bit operand modifiers");
+                }
                 let i64t = self.s.m.int(64);
-                let x = match v.src.first().copied() {
-                    Some(Operand::Literal(k)) => {
+                let mut x = match *v.src.first().ok_or("a missing operand")? {
+                    Operand::Literal(k) => {
                         let k32 = self.s.m.i32(k);
                         let hi = self.s.m.cast(c, Cast::ZExt, k32, i64t);
                         let thirty_two = self.s.m.int_const(i64t, 32);
@@ -6147,7 +6150,7 @@ impl<'a> Lower<'a> {
                     }
                     // An inline f32 constant is the same value as a binary64
                     // in a 64-bit float operand, not its f32 bits widened.
-                    Some(Operand::Const(c @ 240..=248)) => {
+                    Operand::Const(c @ 240..=248) => {
                         let x = [
                             0.5f64,
                             -0.5,
@@ -6161,8 +6164,16 @@ impl<'a> Lower<'a> {
                         ][usize::from(c - 240)];
                         self.s.m.int_const(i64t, x.to_bits() as i64)
                     }
-                    _ => self.src64(inst, 0)?,
+                    op => self.src64_operand(inst, op)?,
                 };
+                if v.abs & 1 != 0 {
+                    let mask = self.s.m.int_const(i64t, i64::MAX);
+                    x = self.s.m.bin(c, Bin::And, x, mask);
+                }
+                if v.neg & 1 != 0 {
+                    let sign = self.s.m.int_const(i64t, i64::MIN);
+                    x = self.s.m.bin(c, Bin::Xor, x, sign);
+                }
                 let double = self.s.m.double();
                 let bits = self.s.m.cast(c, Cast::Bitcast, x, double);
                 let r = self.s.m.cast(c, Cast::FpTrunc, bits, self.s.t.f32);
@@ -6508,10 +6519,14 @@ impl<'a> Lower<'a> {
         if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 || v.sdwa.is_some() || v.dpp.is_some() {
             return Err("64-bit operand modifiers");
         }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        self.src64_operand(inst, op)
+    }
+
+    fn src64_operand(&mut self, inst: &Inst, op: Operand) -> Result<V, Why> {
         let c = self.cur;
         let i64t = self.s.m.int(64);
         self.s.flags |= flags::INT64;
-        let op = *v.src.get(k).ok_or("a missing operand")?;
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
             let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
             let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;

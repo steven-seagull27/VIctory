@@ -1861,3 +1861,55 @@ fn a_64_bit_inline_constant_source_is_the_same_value() {
         assert_eq!(got, 1.0f32.to_bits(), "{backend}: case {i}");
     });
 }
+
+#[test]
+fn v_cvt_f32_f64_applies_source_modifiers_before_conversion() {
+    let pairs = [
+        0.0f64,
+        -0.0,
+        -2.25,
+        1.0,
+        f64::from_bits(0x3FF0_0000_1000_0001),
+        f64::from_bits(0xB690_0000_0000_0001),
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for (abs, neg) in [(false, false), (true, false), (false, true), (true, true)] {
+        let check = |src: u16, literal: Option<u32>, values: &[f64]| {
+            let mut op = vop3(0x18F, 0, src, 0, 0); // v_cvt_f32_f64_e64
+            op[0] |= u32::from(abs) << 8;
+            op[1] |= u32::from(neg) << 29;
+            let mut body = op.to_vec();
+            body.extend(literal);
+            let shader = build_valu_cs(&body);
+            let cases: Vec<_> = values
+                .iter()
+                .map(|x| {
+                    let bits = x.to_bits();
+                    [bits as u32, (bits >> 32) as u32, 0, 0]
+                })
+                .collect();
+            run_cases(&shader, &cases, |backend, i, _, got| {
+                let x = if abs { values[i].abs() } else { values[i] };
+                let want = (if neg { -x } else { x } as f32).to_bits();
+                assert_eq!(
+                    got, want,
+                    "{backend}: src {src}, literal {literal:?}, abs {abs}, neg {neg}, case {i}"
+                );
+            });
+        };
+        check(vgpr(1), None, &pairs);
+        check(sgpr(0), None, &pairs);
+        for (src, value) in [
+            (128, 0.0),
+            (240, 0.5),
+            (241, -0.5),
+            (248, f64::from_bits(0x3FC4_5F30_6DC9_C882)),
+        ] {
+            check(src, None, &[value]);
+        }
+        for high in [0u32, 0x8000_0000, 0xC002_0000, 0x3FF0_0001] {
+            check(255, Some(high), &[f64::from_bits(u64::from(high) << 32)]);
+        }
+    }
+}
