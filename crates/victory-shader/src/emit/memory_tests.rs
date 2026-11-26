@@ -489,6 +489,17 @@ fn root_views_read_their_copy_and_zeros_past_it() {
 
 /// Builds a compute shader with a descriptor table and the view-mark roots.
 fn marked_view_shader(w: &[u32], threads: u32, views: u32) -> HostShader {
+    marked_shader(
+        w,
+        StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [threads, 1, 1],
+        }),
+        views,
+    )
+}
+
+fn marked_shader(w: &[u32], stage_io: StageIo, views: u32) -> HostShader {
     let param = |root, user_data, sgprs, slot| RootParam {
         root,
         table_offset_dwords: 0,
@@ -507,16 +518,18 @@ fn marked_view_shader(w: &[u32], threads: u32, views: u32) -> HostShader {
         user_data: 4,
         slot: 1,
     };
+    let pixel = matches!(stage_io, StageIo::Ps { .. });
+    let stage = if pixel { HwStage::Ps } else { HwStage::Cs };
     let native = NativeProgram {
-        stage: HwStage::Cs,
+        stage,
         wave64: false,
         vgprs: 8,
-        layout: vec![param(RootType::Constants, 0, 4, 0), param(RootType::Table, 4, 1, 1)],
+        layout: vec![
+            param(RootType::Constants, 0, 4, 0),
+            param(RootType::Table, 4, 1, 1),
+        ],
         used: (0..views).map(uav).collect(),
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1,
-            threads: [threads, 1, 1],
-        }),
+        io: stage_io,
         code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
@@ -530,7 +543,11 @@ fn marked_view_shader(w: &[u32], threads: u32, views: u32) -> HostShader {
         io: &io,
         res: &res,
         inputs: Vec::new(),
-        outputs: Vec::new(),
+        outputs: if pixel {
+            vec![mark_signature("SV_Target", 16, 0)]
+        } else {
+            Vec::new()
+        },
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: true,
@@ -538,7 +555,7 @@ fn marked_view_shader(w: &[u32], threads: u32, views: u32) -> HostShader {
     .expect("lower");
     assert!(l.view_marks && !l.memory, "marks without the page table");
     let shader = HostShader {
-        stage: HwStage::Cs,
+        stage,
         dxil: l.dxil,
         user_data: l.user_data,
         samplers: l.samplers,
@@ -554,7 +571,8 @@ fn marked_view_shader(w: &[u32], threads: u32, views: u32) -> HostShader {
         view_marks: l.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
     }
     shader
 }
@@ -651,7 +669,9 @@ fn divergent_view_writes_mark_each_page_in_partial_groups() {
         0x8002_0504, // buffer_store_dword v5, v4, s[8:11], 0 offen
         S_ENDPGM,
     ]);
-    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let value = 0x1234_5678;
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -661,19 +681,33 @@ fn divergent_view_writes_mark_each_page_in_partial_groups() {
             let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
             let mut ud = vec![0; shader.user_data_dwords() as usize];
             for u in &shader.user_data {
-                if u.root == RootType::Constants { ud[u.index as usize] = value; }
+                if u.root == RootType::Constants {
+                    ud[u.index as usize] = value;
+                }
             }
             let words = 3 * (65536 / 4) + threads;
-            let out = host.dispatch(&root, &pso, &Dispatch {
-                roots: vec![
-                    (0, Root::Constants(ud)),
-                    (1, Root::View { srv: true, data: vec![30, 0] }),
-                    (2, Root::Uav(3)),
-                ],
-                views: &[View::RawUav(words)],
-                samplers: &[],
-                groups: [1, 1, 1],
-            }).unwrap_or_else(|e| panic!("{label}, {threads} threads: {e}"));
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: vec![30, 0],
+                                },
+                            ),
+                            (2, Root::Uav(3)),
+                        ],
+                        views: &[View::RawUav(words)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}, {threads} threads: {e}"));
             let mut want = vec![0; words as usize];
             let mut bits = [0u32; 3];
             for tid in 0..threads {
@@ -684,10 +718,172 @@ fn divergent_view_writes_mark_each_page_in_partial_groups() {
                     bits[(bit / 32) as usize] |= 1 << (bit % 32);
                 }
             }
-            let mismatch = out[0].iter().zip(&want).position(|(got, expected)| got != expected);
+            let mismatch = out[0]
+                .iter()
+                .zip(&want)
+                .position(|(got, expected)| got != expected);
             assert_eq!(out[0].len(), want.len());
-            assert_eq!(mismatch, None, "{label}, {threads} threads: first wrong store");
+            assert_eq!(
+                mismatch, None,
+                "{label}, {threads} threads: first wrong store"
+            );
             assert_eq!(out[1], bits, "{label}, {threads} threads: page bitmap");
+            ran += 1;
+        }
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+fn mark_signature(name: &str, kind: u8, interp: u8) -> super::container::SigElement {
+    super::container::SigElement {
+        name: name.into(),
+        index: 0,
+        kind,
+        comp: 9,
+        interp,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 15,
+        half: false,
+    }
+}
+
+/// Pass the test's clip-space triangle positions straight to the rasterizer.
+fn mark_vertex_shader() -> Vec<u8> {
+    use super::bitcode::{Attr, Term};
+    use super::shader::Shader;
+    let mut s = Shader::new(false);
+    for col in 0..4 {
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+        let coord = s.op(s.entry, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+        let args = [args[0], args[1], args[2], coord];
+        s.op(
+            s.entry,
+            "storeOutput.f32",
+            Attr::NoUnwind,
+            s.t.void,
+            5,
+            &args,
+        );
+    }
+    s.inputs = vec![mark_signature("POSITION", 0, 0)];
+    s.outputs = vec![mark_signature("SV_Position", 3, 0)];
+    s.m.terminate(s.entry, Term::Ret);
+    s.finish()
+}
+
+/// The real pixel in a partially covered quad must set the write mark,
+/// whichever corner it occupies. The atomic count and covered pixels
+/// separately check the draw's coverage.
+#[test]
+fn partially_covered_quads_mark_their_pixel_store() {
+    use super::host::Draw;
+    use windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_PIXEL;
+    let mut w = vec![s_mov_b32(5, ZERO as u8)];
+    w.extend(s_load(2, 8, 4, 0));
+    w.extend([
+        S_WAITCNT_ALL,
+        v_mov_b32(1, 129), // v1 = 1 (integer addend)
+        0xE0C8_0008,
+        0x8002_0100,       // buffer_atomic_add v1, off, s[8:11], 0 offset:8
+        v_mov_b32(2, 242), // v2 = 1.0 (covered pixels)
+        0xF800_180F,
+        0x0202_0202, // exp mrt0 v2, v2, v2, v2 done vm
+        S_ENDPGM,
+    ]);
+    let ps = marked_shader(
+        &w,
+        StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: Vec::new(),
+        },
+        1,
+    );
+    let vs = mark_vertex_shader();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let root = host
+            .root_signature_for(&[(&ps, D3D12_SHADER_VISIBILITY_PIXEL)])
+            .unwrap();
+        let pso = host
+            .pipeline_with(&root, &vs, &ps.dxil)
+            .expect("pixel pipeline");
+        for case in 0..5 {
+            let x = 2.0 + (case % 2) as f32;
+            let y = 2.0 + (case / 2) as f32;
+            let v = if case < 4 {
+                [
+                    (x + 0.05, y + 0.05),
+                    (x + 0.95, y + 0.05),
+                    (x + 0.5, y + 0.95),
+                ]
+            } else {
+                [(1.1, 1.1), (7.35, 1.1), (1.1, 7.35)]
+            };
+            let vertices = v
+                .map(|(x, y)| [x / 4.0 - 1.0, 1.0 - y / 4.0, 0.5, 1.0])
+                .concat();
+            let out = host
+                .draw_with_buffers(
+                    &root,
+                    &pso,
+                    &Draw {
+                        roots: vec![
+                            (
+                                0,
+                                Root::Constants(vec![0; ps.user_data_dwords().max(1) as usize]),
+                            ),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: vec![31, 0],
+                                },
+                            ),
+                            (2, Root::Uav(3)),
+                        ],
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &vertices,
+                        stride: 16,
+                        size: (8, 8),
+                        mesh_groups: 0,
+                    },
+                    Some(4),
+                )
+                .unwrap_or_else(|e| panic!("{label}, case {case}: {e}"));
+            let mut inside = 0;
+            for (i, pixel) in out.colors.iter().enumerate() {
+                let (px, py) = ((i % 8) as f32 + 0.5, (i / 8) as f32 + 0.5);
+                let covered = if case < 4 {
+                    px == x + 0.5 && py == y + 0.5
+                } else {
+                    px > 1.1 && py > 1.1 && px + py < 8.45
+                };
+                assert_eq!(
+                    *pixel,
+                    [if covered { 1.0 } else { 0.0 }; 4],
+                    "{label}, case {case}, pixel {i}"
+                );
+                inside += u32::from(covered);
+            }
+            assert_eq!(
+                out.uavs[0],
+                [0, 0, inside, 0],
+                "{label}, case {case}: atomic count"
+            );
+            assert_eq!(
+                out.uavs[1],
+                [1 << 31, 0, 0],
+                "{label}, case {case}: write bitmap"
+            );
             ran += 1;
         }
     }

@@ -926,13 +926,13 @@ pub enum Root {
         index: usize,
     },
     /// A root CBV (or with `srv`, a root SRV) over a buffer of these
-    /// dwords ([`Host::dispatch`] only).
+    /// dwords.
     View {
         srv: bool,
         data: Vec<u32>,
     },
     /// A root raw UAV of this many dwords, zeroed, read back after the
-    /// heap's UAVs ([`Host::dispatch`] only).
+    /// heap's UAVs.
     Uav(u32),
 }
 
@@ -953,6 +953,13 @@ pub struct Draw<'a> {
 }
 
 #[cfg(test)]
+pub struct DrawReadback {
+    pub colors: Vec<[f32; 4]>,
+    /// Heap UAV first, then root UAVs in binding order.
+    pub uavs: Vec<Vec<u32>>,
+}
+
+#[cfg(test)]
 impl Host {
     /// Draws one triangle into an RGBA32F target and returns its texels.
     pub fn draw(
@@ -961,6 +968,17 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
+        Ok(self.draw_with_buffers(root, pso, d, None)?.colors)
+    }
+
+    /// Also reads back a raw UAV after the heap's textures, and any root UAVs.
+    pub fn draw_with_buffers(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+        raw_uav_words: Option<u32>,
+    ) -> Result<DrawReadback, String> {
         let _guard = self.lock_warp();
         let dev = &self.device;
         let (w, h) = d.size;
@@ -1047,7 +1065,8 @@ impl Host {
             let views: ID3D12DescriptorHeap = dev
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: d.textures.len().max(1) as u32,
+                    NumDescriptors: (d.textures.len() + usize::from(raw_uav_words.is_some())).max(1)
+                        as u32,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     ..Default::default()
                 })
@@ -1152,6 +1171,64 @@ impl Host {
                 vb.Unmap(0, None);
                 Some(vb)
             };
+            let upload_words = |data: &[u32]| -> Result<ID3D12Resource, String> {
+                let bytes = (data.len() * 4).next_multiple_of(256);
+                let buf = make(
+                    D3D12_HEAP_TYPE_UPLOAD,
+                    &buf_desc(bytes as u64),
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                )?;
+                let mut dst = std::ptr::null_mut();
+                buf.Map(0, None, Some(&mut dst)).map_err(err)?;
+                std::ptr::copy_nonoverlapping(data.as_ptr(), dst.cast::<u32>(), data.len());
+                buf.Unmap(0, None);
+                Ok(buf)
+            };
+            let mut uavs = Vec::new();
+            let mut new_uav = |n: u32| -> Result<ID3D12Resource, String> {
+                let bytes = u64::from(n) * 4;
+                let mut desc = buf_desc(bytes);
+                desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                let buf = make(
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                )?;
+                let zeros = upload_words(&vec![0; n as usize])?;
+                list.CopyBufferRegion(&buf, 0, &zeros, 0, bytes);
+                list.ResourceBarrier(&[transition(
+                    &buf,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+                let rb = make(
+                    D3D12_HEAP_TYPE_READBACK,
+                    &buf_desc(bytes),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                )?;
+                uavs.push((buf.clone(), rb, n, zeros));
+                Ok(buf)
+            };
+            if let Some(n) = raw_uav_words {
+                let buf = new_uav(n)?;
+                let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            NumElements: n,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                            ..Default::default()
+                        },
+                    },
+                };
+                let mut at = views.GetCPUDescriptorHandleForHeapStart();
+                at.ptr += d.textures.len() * view_size;
+                dev.CreateUnorderedAccessView(&buf, None, Some(&desc), at);
+            }
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(sampler_heap.clone())]);
             list.SetGraphicsRootSignature(root);
             for (param, arg) in &d.roots {
@@ -1172,7 +1249,25 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
+                    Root::View { srv, data } => {
+                        let buf = upload_words(data)?;
+                        if *srv {
+                            list.SetGraphicsRootShaderResourceView(
+                                *param,
+                                buf.GetGPUVirtualAddress(),
+                            );
+                        } else {
+                            list.SetGraphicsRootConstantBufferView(
+                                *param,
+                                buf.GetGPUVirtualAddress(),
+                            );
+                        }
+                        keep.push(buf);
+                    }
+                    &Root::Uav(n) => {
+                        let buf = new_uav(n)?;
+                        list.SetGraphicsRootUnorderedAccessView(*param, buf.GetGPUVirtualAddress());
+                    }
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1240,6 +1335,14 @@ impl Host {
                 },
             };
             list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            for (buf, rb, n, _) in &uavs {
+                list.ResourceBarrier(&[transition(
+                    buf,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.CopyBufferRegion(rb, 0, buf, 0, u64::from(*n) * 4);
+            }
             list.Close().map_err(err)?;
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
@@ -1268,7 +1371,17 @@ impl Host {
             }
             readback.Unmap(0, None);
             drop(keep);
-            Ok(out)
+            let mut words = Vec::new();
+            for (_, rb, n, _) in &uavs {
+                let mut p = std::ptr::null_mut();
+                rb.Map(0, None, Some(&mut p)).map_err(err)?;
+                words.push(std::slice::from_raw_parts(p.cast::<u32>(), *n as usize).to_vec());
+                rb.Unmap(0, None);
+            }
+            Ok(DrawReadback {
+                colors: out,
+                uavs: words,
+            })
         }
     }
 }
