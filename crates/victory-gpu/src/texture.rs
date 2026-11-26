@@ -570,7 +570,7 @@ impl Staging {
     pub(crate) fn refresh(&self) -> Option<Upload> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let (read, buffer) = self.refresh_now();
+        let (read, buffer) = self.refresh_now(Self::detile);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -579,7 +579,10 @@ impl Staging {
 
     /// Returns the bytes of title memory read, and the buffer it detiled
     /// into with the subresources detiled.
-    fn refresh_now(&self) -> (usize, Option<Upload>) {
+    fn refresh_now(
+        &self,
+        detile: impl FnOnce(&Self, &[u8], &[Sub]) -> Option<(ID3D12Resource, u64)>,
+    ) -> (usize, Option<Upload>) {
         let all = || (0..self.footprints.len() as u32).map(|i| (i, None)).collect::<Vec<Sub>>();
         let size = self.layout.size as usize;
         let start = self.memory as usize;
@@ -592,7 +595,8 @@ impl Staging {
                 return (0, None);
             }
             let ranges = t.take(start, start + size);
-            if ranges.is_empty() {
+            let untracked = t.untracked(start, start + size);
+            if ranges.is_empty() && untracked.is_empty() {
                 return (0, None);
             }
             // Only the subresources in the pages that changed (streamed
@@ -603,7 +607,7 @@ impl Staging {
             let touched: Vec<usize> = (0..n)
                 .filter(|&i| {
                     let (a, b) = span(i);
-                    ranges.iter().any(|&(f, e)| f - start < b && a < e - start)
+                    ranges.iter().chain(&untracked).any(|&(f, e)| f - start < b && a < e - start)
                 })
                 .collect();
             // A changed page that holds only the subresource's bytes says it
@@ -617,7 +621,10 @@ impl Staging {
             let own = |i: usize| {
                 let (a, b) = span(i);
                 let (a0, b0) = (start + a, start + b);
-                ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0))
+                // A mip spanning ordinary title memory must consider those
+                // bytes even when no tracked page was written.
+                !untracked.iter().any(|&(f, e)| f < b0 && a0 < e)
+                    && ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0))
             };
             // The changed bytes as offsets into the memory, for the layout.
             let changed: Vec<(usize, usize)> = ranges
@@ -678,8 +685,9 @@ impl Staging {
             if fresh.is_empty() {
                 return (bytes, None);
             }
-            let buffer = self.detile(read, &fresh);
+            let buffer = detile(self, read, &fresh);
             if buffer.is_none() {
+                t.retry(&ranges);
                 for &(i, _) in &fresh {
                     last.hashes[i as usize] = None;
                 }
@@ -703,7 +711,7 @@ impl Staging {
             }
             let zeros = vec![0u8; size];
             let every = all();
-            let buffer = self.detile(&zeros, &every);
+            let buffer = detile(self, &zeros, &every);
             last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
             return (0, buffer.map(|(b, at)| (b, at, every)));
         }
@@ -716,7 +724,7 @@ impl Staging {
             return (size, None);
         }
         let every = all();
-        let buffer = self.detile(tiled, &every);
+        let buffer = detile(self, tiled, &every);
         last.hash = buffer.is_some().then_some(hash);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -903,8 +911,23 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn untracked_bytes(staging: &Staging) -> Vec<(usize, usize)> {
+        let start = staging.memory as usize;
+        staging.tracked.as_ref().unwrap().untracked(start, start + staging.layout.size as usize)
+    }
+
+    /// Simulates unavailable staging space after the texture took its pages.
+    pub(crate) fn defer_one_upload(staging: &Staging) {
+        let mut attempted = false;
+        let (read, upload) = staging.refresh_now(|_, _, _| {
+            attempted = true;
+            None
+        });
+        assert!(attempted && read > 0 && upload.is_none());
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
