@@ -22,45 +22,48 @@ pub(super) fn mask_uses_console_lanes(
         LaneExit::Branch { when, .. } => Some(when),
         _ => None,
     });
-    let selects = p
-        .blocks
-        .iter()
-        .enumerate()
-        .filter(|&(b, _)| st.reach[b] != Bool::FALSE)
-        .flat_map(|(_, block)| &block.insts)
-        .filter_map(|i| {
-            let Fields::Valu(v) = &i.fields else {
-                return None;
-            };
-            if !matches!(
-                i.name(),
-                "v_cndmask_b32"
-                    | "v_add_co_ci_u32"
-                    | "v_sub_co_ci_u32"
-                    | "v_subrev_co_ci_u32"
-            ) {
-                return None;
-            }
-            let &Operand::Scalar { code, .. } = v.src.get(2)? else {
-                return None;
-            };
-            if code == NULL {
-                return None;
-            }
-            let m = i.read(Reg::S(code))?;
-            st.masks.get(&m).copied()
-        });
-    let mut seen_bools = HashSet::new();
-    let mut seen_phis = HashSet::new();
-    let mut work: Vec<Bool> = st
+    let mut work: Vec<_> = st
         .guards
         .iter()
         .flatten()
         .flatten()
         .copied()
         .chain(whens)
-        .chain(selects)
         .collect();
+    for inst in p
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|&(b, _)| st.reach[b] != Bool::FALSE)
+        .flat_map(|(_, block)| &block.insts)
+    {
+        let Fields::Valu(v) = &inst.fields else {
+            continue;
+        };
+        if !matches!(
+            inst.name(),
+            "v_cndmask_b32" | "v_add_co_ci_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32"
+        ) {
+            continue;
+        }
+        match v.src.get(2) {
+            Some(&Operand::Const(k))
+                if crate::resource::inline(k).is_some_and(|x| x != 0 && x != u32::MAX) =>
+            {
+                return true;
+            }
+            Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                if let Some(m) = inst.read(Reg::S(code))
+                    && let Some(&bits) = st.masks.get(&m).or_else(|| st.other.get(&m))
+                {
+                    work.push(bits);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut seen_bools = HashSet::new();
+    let mut seen_phis = HashSet::new();
     while let Some(g) = work.pop() {
         if !seen_bools.insert(g) {
             continue;
