@@ -3,7 +3,6 @@
 
 use super::Lower;
 use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
-use crate::emit::shader::flags;
 
 impl Lower<'_> {
     /// A UNORM / SNORM channel `x` (its decoded f32 bits) of `w` bits as
@@ -16,8 +15,7 @@ impl Lower<'_> {
         let c = self.cur;
         let bits = if snorm { w - 1 } else { w };
         let d = (1u32 << bits) - 1;
-        let (i32t, i64t) = (self.s.t.i32, self.s.m.int(64));
-        self.s.flags |= flags::INT64;
+        let i32t = self.s.t.i32;
         // the code, back from the decoded value (|value| for SNORM)
         let mag = self.s.m.i32(0x7FFF_FFFF);
         let ax = self.s.m.bin(c, Bin::And, x, mag);
@@ -26,13 +24,17 @@ impl Lower<'_> {
         let y = self.s.m.bin(c, Bin::Mul, af, df);
         let y = self.unary(26, y); // round to nearest even
         let y = self.s.m.cast(c, Cast::FpToUi, y, i32t);
-        // first 32 bits of y / d
-        let y64 = self.s.m.cast(c, Cast::ZExt, y, i64t);
-        let k32 = self.s.m.int_const(i64t, 32);
-        let y64 = self.s.m.bin(c, Bin::Shl, y64, k32);
-        let d64 = self.s.m.int_const(i64t, i64::from(d));
-        let p = self.s.m.bin(c, Bin::UDiv, y64, d64);
-        let p = self.s.m.cast(c, Cast::Trunc, p, i32t);
+        // The binary fraction repeats the entire field. Multiply to place
+        // each complete copy, then fill any remaining low bits with its prefix.
+        // 0 and the all-ones field are selected explicitly below.
+        let copies = self.s.m.i32(u32::MAX / d);
+        let mut p = self.s.m.bin(c, Bin::Mul, y, copies);
+        let tail = 32 % bits;
+        if tail != 0 {
+            let shift = self.s.m.i32(bits - tail);
+            let prefix = self.s.m.bin(c, Bin::LShr, y, shift);
+            p = self.s.m.bin(c, Bin::Or, p, prefix);
+        }
         let lz = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[p]);
         // normal: 11 bits after the leading one and the round bit
         let k14 = self.s.m.i32(14);

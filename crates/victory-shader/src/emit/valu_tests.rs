@@ -540,6 +540,19 @@ fn tbuffer_d16_loads_saturate_32_bit_integers() {
 }
 
 #[test]
+fn d16_normalized_format_loads_do_not_require_int64() {
+    for unorm in [1, 7, 14, 23, 30, 37, 44, 50, 56, 65] {
+        for format in [unorm, unorm + 1] {
+            let shader = tbuffer_load_of_v1(11, format);
+            let container = crate::Container::parse(&shader.dxil).unwrap();
+            let flags = container.part(crate::FourCC::SFI0).unwrap().data;
+            let flags = u64::from_le_bytes(flags.try_into().unwrap());
+            assert_eq!(flags & 0x8000, 0, "format {format} requires Int64ShaderOps");
+        }
+    }
+}
+
+#[test]
 fn tbuffer_d16_loads_of_16_bit_norms_round_once() {
     // tbuffer_load_format_d16_x of 16_UNORM / 16_SNORM: RDNA2 rounds the
     // normalized value to f16 once, to nearest even (gfx1031 for buffer
