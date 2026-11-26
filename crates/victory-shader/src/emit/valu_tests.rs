@@ -85,6 +85,14 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
 /// [`try_build_valu_cs`] with `lanes` threads in the group (one wave of 32
 /// at most); `v0` holds each thread's index.
 fn try_build_valu_cs_lanes(body: &[u32], lanes: u32) -> Result<HostShader, crate::ShaderError> {
+    try_build_valu_cs_output(body, lanes, &buffer_store_dword(0, 8, 0))
+}
+
+fn try_build_valu_cs_output(
+    body: &[u32],
+    lanes: u32,
+    output: &[u32],
+) -> Result<HostShader, crate::ShaderError> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -95,7 +103,7 @@ fn try_build_valu_cs_lanes(body: &[u32], lanes: u32) -> Result<HostShader, crate
         words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.extend_from_slice(output);
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -220,6 +228,18 @@ fn run_cases_on(
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
     wave32: bool,
 ) {
+    run_buffer_cases(shader, cases, 1, wave32, |label, i, inputs, out| {
+        check(label, i, inputs, out[0]);
+    });
+}
+
+fn run_buffer_cases(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    output_dwords: u32,
+    wave32: bool,
+    mut check: impl FnMut(&str, usize, [u32; 4], &[u32]),
+) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -253,13 +273,13 @@ fn run_cases_on(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &[View::RawUav(output_dwords)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            check(label, i, inputs, out[0][0]);
+            check(label, i, inputs, &out[0]);
         }
         ran += 1;
     }
@@ -2313,13 +2333,8 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
     });
 }
 
-/// A whole-wave binary64 sum as the console compiler expands
-/// `WaveActiveSum` of a double (each dword moved by DPP on its own,
-/// `v_add_f64` on the pairs, the rows joined by `v_permlanex16`, lane 31 read
-/// and copied out), then converted with `v_cvt_f32_f64`. One thread: the sum
-/// is its own value, so the result is `x as f32`.
-#[test]
-fn a_whole_wave_binary64_sum_reaches_the_host() {
+/// Console wave32 reduction of v[1:2] under EXEC. The scalar sum lands in s[24:25].
+fn binary64_sum_section() -> Vec<u32> {
     let mut body = vec![0xBE94_3DC1]; // s_or_saveexec_b32 s20, -1
     body.extend(vop3(0x101, 5, 128, vgpr(1), sgpr(20))); // v_cndmask_b32 v5, 0, v1, s20
     body.extend(vop3(0x101, 6, 128, vgpr(2), sgpr(20))); // v_cndmask_b32 v6, 0, v2, s20
@@ -2337,6 +2352,17 @@ fn a_whole_wave_binary64_sum_reaches_the_host() {
     body.push(s_mov_b32(24, 22));
     body.push(s_mov_b32(25, 23));
     body.push(s_mov_b32(126, 20)); // s_mov_b32 exec_lo, s20
+    body
+}
+
+/// A whole-wave binary64 sum as the console compiler expands
+/// `WaveActiveSum` of a double (each dword moved by DPP on its own,
+/// `v_add_f64` on the pairs, the rows joined by `v_permlanex16`, lane 31 read
+/// and copied out), then converted with `v_cvt_f32_f64`. One thread: the sum
+/// is its own value, so the result is `x as f32`.
+#[test]
+fn a_whole_wave_binary64_sum_reaches_the_host() {
+    let mut body = binary64_sum_section();
     body.push(vop1(0x00f, 0, sgpr(24))); // v_cvt_f32_f64 v0, s[24:25]
     let shader = build_valu_cs(&body);
     let cases = [1.0f64, -2.5, 3.0e10, 0.1, 0.0].map(|x| {
@@ -2360,22 +2386,7 @@ fn a_whole_wave_binary64_sum_counts_the_active_lanes_only() {
     body.extend(vop3(0x125, 2, sgpr(1), vgpr(2), 0)); // v_add_nc_u32 v2, s1, v2
     body.extend(vop3(0x0C4, 106, sgpr(2), vgpr(0), 0)); // v_cmp_gt_u32 vcc_lo, s2, v0
     body.push(0xBE95_3C6A); // s_and_saveexec_b32 s21, vcc_lo
-    body.push(0xBE94_3DC1); // s_or_saveexec_b32 s20, -1
-    body.extend(vop3(0x101, 5, 128, vgpr(1), sgpr(20))); // v_cndmask_b32 v5, 0, v1, s20
-    body.extend(vop3(0x101, 6, 128, vgpr(2), sgpr(20))); // v_cndmask_b32 v6, 0, v2, s20
-    for ctrl in [0x00B1u32, 0x004E, 0x0164, 0x0168] {
-        body.extend([vop1(1, 7, 0xFA), 0xFF00_0000 | ctrl << 8 | 5]);
-        body.extend([vop1(1, 8, 0xFA), 0xFF00_0000 | ctrl << 8 | 6]);
-        body.extend(vop3(0x164, 5, vgpr(7), vgpr(5), 0));
-    }
-    body.extend(vop3(0x378, 7, vgpr(5), 128, 128)); // v_permlanex16_b32 v7, v5, 0, 0
-    body.extend(vop3(0x378, 8, vgpr(6), 128, 128)); // v_permlanex16_b32 v8, v6, 0, 0
-    body.extend(vop3(0x164, 5, vgpr(7), vgpr(5), 0)); // v_add_f64 v[5:6], v[7:8], v[5:6]
-    body.extend(vop3(0x360, 22, vgpr(5), 128 + 31, 0)); // v_readlane_b32 s22, v5, 31
-    body.extend(vop3(0x360, 23, vgpr(6), 128 + 31, 0)); // v_readlane_b32 s23, v6, 31
-    body.push(s_mov_b32(24, 22));
-    body.push(s_mov_b32(25, 23));
-    body.push(s_mov_b32(126, 20)); // s_mov_b32 exec_lo, s20
+    body.extend(binary64_sum_section());
     body.push(vop1(0x00f, 0, sgpr(24))); // v_cvt_f32_f64 v0, s[24:25]
     let shader = try_build_valu_cs_lanes(&body, 32).expect("build");
     let cases = [1u32, 5, 17, 31, 32].map(|n| [0, 0x3FF0_0000, n, 0]);
@@ -2383,6 +2394,87 @@ fn a_whole_wave_binary64_sum_counts_the_active_lanes_only() {
         let want = ((1u64 << n) - 1) as f64 as f32;
         assert_eq!(got, want.to_bits(), "{backend}: case {i}, {n} lanes");
     });
+}
+
+/// Sum the magnitudes in integer units of 2^-52. Every addend is a multiple of
+/// 32 units, so every partial sum of up to 32 lanes is exact in binary64.
+fn exact_wave_sum(seed: u32, high_word: u32, mask: u32) -> [u32; 2] {
+    let units: u64 = (0..32)
+        .filter(|lane| (mask >> lane) & 1 != 0)
+        .map(|lane| (1u64 << 52) + u64::from(seed + 256 * lane))
+        .sum();
+    if units == 0 {
+        return [0, 0];
+    }
+    let shift = units.ilog2() - 52;
+    assert_eq!(units & ((1u64 << shift) - 1), 0);
+    let fraction = (units >> shift) & ((1u64 << 52) - 1);
+    let sign = high_word & 0x8000_0000;
+    [
+        fraction as u32,
+        sign | ((1023 + shift) << 20) | (fraction >> 32) as u32,
+    ]
+}
+
+#[test]
+fn a_whole_wave_binary64_sum_preserves_both_words() {
+    let sentinel = [0xDEAD_BEEF, 0xABAD_1DEA];
+    let mut body = Vec::new();
+    // v[1:2] = s1:(s0 + 256 * lane); v9 is this lane's 16-byte output offset.
+    body.extend(vop3(0x11A, 1, 128 + 8, vgpr(0), 0));
+    body.extend(vop3(0x125, 1, sgpr(0), vgpr(1), 0));
+    body.extend(vop3(0x11A, 9, 128 + 4, vgpr(0), 0));
+    body.extend([vop1(1, 10, 255), sentinel[0], vop1(1, 11, 255), sentinel[1]]);
+    // Set EXEC from the runtime mask in s2, saving the original mask in s21.
+    body.extend(vop3(0x116, 13, vgpr(0), sgpr(2), 0)); // v_lshrrev_b32
+    body.extend(vop3(0x11B, 13, 129, vgpr(13), 0)); // v_and_b32 v13, 1, v13
+    body.extend(vop3(0x0C5, 106, 128, vgpr(13), 0)); // v_cmp_ne_u32 vcc, 0, v13
+    body.push(0xBE95_3C6A); // s_and_saveexec_b32 s21, vcc_lo
+    body.extend(binary64_sum_section());
+    body.push(vop1(1, 10, sgpr(24)));
+    body.push(vop1(1, 11, sgpr(25)));
+    body.push(s_mov_b32(126, 21)); // restore all lanes for the second copy
+    body.push(vop1(1, 12, sgpr(24)));
+    body.push(vop1(1, 13, sgpr(25)));
+    let store = [0xE078_1000, 0x8002_0A09]; // buffer_store_dwordx4 v[10:13], v9, s[8:11], 0 offen
+    let shader = try_build_valu_cs_output(&body, 32, &store).expect("build");
+    let mut cases = Vec::new();
+    for seed in [32, 0x0FFF_FFE0] {
+        for high in [0x3FF0_0000, 0xBFF0_0000] {
+            for mask in [
+                0,
+                1,
+                0x8000_0000,
+                0x8001_0041,
+                0x5555_5555,
+                0xAAAA_AAAA,
+                0x00FF_01F1,
+                0xFFFF_FFFE,
+                u32::MAX,
+            ] {
+                cases.push([seed, high, mask, 0]);
+            }
+        }
+    }
+    run_buffer_cases(
+        &shader,
+        &cases,
+        32 * 4,
+        true,
+        |backend, i, [seed, high, mask, _], got| {
+            let pair = exact_wave_sum(seed, high, mask);
+            assert_eq!(got.len(), 32 * 4);
+            for (lane, row) in got.chunks_exact(4).enumerate() {
+                let masked = if (mask >> lane) & 1 != 0 {
+                    pair
+                } else {
+                    sentinel
+                };
+                assert_eq!(row[..2], masked, "{backend}: case {i} lane {lane} masked");
+                assert_eq!(row[2..], pair, "{backend}: case {i} lane {lane} broadcast");
+            }
+        },
+    );
 }
 
 /// `v_cvt_f32_f64`: the pair v1:v2 read as binary64, truncated to f32 bits
