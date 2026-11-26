@@ -515,6 +515,41 @@ fn tbuffer_d16_loads_pack_two_channels_per_dword() {
     }
 }
 
+/// A float channel wider than a half is cut toward zero in a d16 load, as
+/// RDNA2 packs it, also where the host's own conversion rounds to nearest
+/// (vkd3d-proton on NVIDIA): (stored f32, loaded f16).
+const D16_FLOATS: [(f32, u32); 12] = [
+    (1.0, 0x3C00),
+    (1.0 + 1.0 / 2048.0, 0x3C00), // a tie
+    (1.0 + 3.0 / 2048.0, 0x3C01), // a tie
+    (1.0 + 1.9 / 1024.0, 0x3C01),
+    (-1.0 - 3.0 / 2048.0, 0xBC01),
+    (65_504.0, 0x7BFF),
+    (70_000.0, 0x7BFF), // past the largest half
+    (-70_000.0, 0xFBFF),
+    (f32::INFINITY, 0x7C00),
+    (f32::NEG_INFINITY, 0xFC00),
+    (3.9 / 16_777_216.0, 0x0003), // subnormal halves
+    (0.9 / 16_777_216.0, 0x0000),
+];
+
+#[test]
+fn tbuffer_d16_loads_cut_32_bit_floats_toward_zero() {
+    // tbuffer_load_format_d16_x of a 32_FLOAT.
+    let shader = tbuffer_load_of_v1(8, 22);
+    let inputs = D16_FLOATS.map(|(f, _)| [f.to_bits(), 0, 0, 0]);
+    let mut wrong = Vec::new();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let (stored, want) = D16_FLOATS[i];
+        // Only the low half: what an odd last channel leaves in the high one
+        // is another matter.
+        if got & 0xFFFF != want {
+            wrong.push(format!("{backend}: {stored} = {:#06x}, want {want:#06x}", got & 0xFFFF));
+        }
+    });
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 #[test]
 fn tbuffer_d16_loads_saturate_32_bit_integers() {
     // tbuffer_load_format_d16_x of a 32-bit integer: RDNA2 saturates it to

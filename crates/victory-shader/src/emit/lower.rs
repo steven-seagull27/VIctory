@@ -2382,7 +2382,7 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, nan, fallback, rounded)
     }
 
-    /// `f` as an f16 in the low bits, rounded toward zero: the nearest-even
+    /// `f` as an f16 in the low bits, rounded toward zero: the host's
     /// conversion, one step back toward zero where it rounded away (which
     /// also turns an overflow to infinity into the largest finite half).
     fn f16_toward_zero(&mut self, f: V) -> V {
@@ -5231,6 +5231,9 @@ impl<'a> Lower<'a> {
             } else if matches!(numeric, Numeric::Uscaled | Numeric::Sscaled) {
                 let f = self.as_float(x);
                 self.narrow16_bits(f, false)
+            } else if matches!(numeric, Numeric::Float) {
+                let f = self.as_float(x);
+                self.f16_toward_zero(f)
             } else {
                 let (f, i32t) = (self.as_float(x), self.s.t.i32);
                 self.s
