@@ -192,6 +192,10 @@ struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
     warp_permute: bool,
+    /// Participating host lanes of a single incoming branch edge, balloted
+    /// before the wave splits on WARP.
+    permlane_edges: HashMap<usize, [V; 2]>,
+    permlane_full: std::cell::OnceCell<Option<Vec<bool>>>,
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
@@ -660,6 +664,8 @@ impl<'a> Lower<'a> {
             s,
             x,
             warp_permute: warp_permute && x.native.stage == HwStage::Cs,
+            permlane_edges: HashMap::new(),
+            permlane_full: Default::default(),
             bad,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
@@ -3109,44 +3115,6 @@ impl<'a> Lower<'a> {
         )
     }
 
-    /// On WARP 1.0.22, divergent WaveReadLaneAt can select the wrong
-    /// four-lane group. Hold the group constant in each read, then select
-    /// the requested group's result. See #2949.
-    fn read_lane_on_warp(&mut self, value: V, lane: V, active: [V; 2]) -> V {
-        let c = self.cur;
-        let me = self.lane_index();
-        let i32t = self.s.t.i32;
-        let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[me]);
-        let inner_mask = self.s.m.i32(3);
-        let outer_mask = self.s.m.i32(!3);
-        let inner = self.s.m.bin(c, Bin::And, lane, inner_mask);
-        let outer = self.s.m.bin(c, Bin::And, lane, outer_mask);
-        let zero = self.s.m.i32(0);
-        let one = self.s.m.i32(1);
-        let bank_mask = self.s.m.i32(15);
-        let bit = self.s.m.bin(c, Bin::Shl, one, inner);
-        let mut result = zero;
-        for start in (0..self.wave()).step_by(4) {
-            let base = self.s.m.i32(start);
-            let shift = self.s.m.i32(start % 32);
-            let mask = self.s.m.bin(c, Bin::LShr, active[(start / 32) as usize], shift);
-            let mask = self.s.m.bin(c, Bin::And, mask, bank_mask);
-            let nonempty = self.s.m.cmp(c, pred::NE, mask, zero);
-            let possible = self.s.m.bin(c, Bin::And, mask, bit);
-            let live = self.s.m.cmp(c, pred::NE, possible, zero);
-            let fallback = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[mask]);
-            let selected = self.s.m.select(c, live, inner, fallback);
-            let bank_lane = self.s.m.bin(c, Bin::Or, selected, base);
-            // An unselected read also needs a live host source. Use the
-            // wave's first lane for a group with no active source.
-            let source = self.s.m.select(c, nonempty, bank_lane, first);
-            let read = self.read_lane(value, source);
-            let requested = self.s.m.cmp(c, pred::EQ, outer, base);
-            result = self.s.m.select(c, requested, read, result);
-        }
-        result
-    }
-
     /// Whether `src` is active under the current `EXEC` mask (`guard` for
     /// straight-line narrowing, plus the host wave's live lanes for
     /// branch-structurised control flow). Returns `None` for unguarded pixel
@@ -3307,15 +3275,7 @@ impl<'a> Lower<'a> {
             };
             let direct = (!self.warp_permute).then(|| self.read_lane(x, lane));
             let on = guard.unwrap_or_else(|| self.s.m.bool(true));
-            let i32t = self.s.t.i32;
-            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-            let ballot = self
-                .s
-                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
-            let (lo, hi) = (
-                self.s.m.extract(c, ballot, 0),
-                self.s.m.extract(c, ballot, 1),
-            );
+            let [lo, hi] = self.active_lane_words(on);
             let running = self.lane_bit_of(c, lane, lo, hi);
             let r = direct.unwrap_or_else(|| self.read_lane_on_warp(x, lane, [lo, hi]));
             let z = k(self, 0);
@@ -10246,6 +10206,10 @@ impl<'a> Lower<'a> {
                 };
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
+                if self.warp_permute && taken != not_taken {
+                    self.record_permlane_edge(b, taken, cond, true);
+                    self.record_permlane_edge(b, not_taken, cond, false);
+                }
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
                 for (to, via) in [(taken, t), (not_taken, f)] {
                     if !back(self, to) {

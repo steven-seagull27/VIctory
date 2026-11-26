@@ -78,12 +78,12 @@ fn native(cross: bool, fi: bool, bc: bool, alias: bool, wave64: bool, before_shu
     }
 }
 
-fn lowered(native: &NativeProgram) -> Result<HostShader, ShaderError> {
+fn lowered(native: &NativeProgram, software: bool) -> Result<HostShader, ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
     let io = io::raise(&p, native).expect("io");
-    let result = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p: &p,
         st: &st,
@@ -94,8 +94,8 @@ fn lowered(native: &NativeProgram) -> Result<HostShader, ShaderError> {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
-    });
-    let result = result?;
+    };
+    let result = lower::lower_with(&parts, software)?;
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: result.dxil,
@@ -129,7 +129,7 @@ fn permlane_fetch_inactive_outside_the_host_branch_is_rejected() {
     // into a host lane branch, so FI cannot read lanes that took the skip.
     let native = native(true, true, false, false, false, &[0xBF88_0002]); // s_cbranch_execz +2 (to the EXEC restore)
     assert!(matches!(
-        lowered(&native),
+        lowered(&native, false),
         Err(ShaderError::Unsupported {
             what: "a permlane fetch from lanes outside the host branch",
             ..
@@ -141,13 +141,13 @@ fn permlane_fetch_inactive_outside_the_host_branch_is_rejected() {
 fn permlane_fetch_inactive_after_reconvergence_is_allowed() {
     // The branch only skips a scalar nop; every host lane meets at the shuffle.
     let native = native(true, true, false, false, false, &[0xBF88_0001, 0xBF80_0000]);
-    lowered(&native).expect("fetch-inactive after the lanes reconverge");
+    lowered(&native, false).expect("fetch-inactive after the lanes reconverge");
 }
 
 #[test]
 fn permlane_fetch_inactive_inside_a_uniform_branch_is_allowed() {
     let native = native(true, true, false, false, false, &[0xBF06_8000, 0xBF85_0002]); // scalar compare; skip shuffle on SCC
-    lowered(&native).expect("all host lanes take the scalar branch together");
+    lowered(&native, false).expect("all host lanes take the scalar branch together");
 }
 
 #[test]
@@ -157,7 +157,7 @@ fn permlane_fetch_inactive_under_a_computed_uniform_scalar_is_allowed() {
         0xbf06_800c, // s_cmp_eq_u32 s12, 0
         0xbf85_0002, // skip the FI shuffle on SCC
     ]);
-    lowered(&native).expect("the scalar argument and literal agree across host lanes");
+    lowered(&native, false).expect("the scalar argument and literal agree across host lanes");
 }
 
 #[test]
@@ -171,7 +171,7 @@ fn permlane_fetch_inactive_after_a_divergent_scalar_phi_is_rejected() {
         0xbf85_0002, // skip the FI shuffle on SCC
     ]);
     assert!(matches!(
-        lowered(&native),
+        lowered(&native, false),
         Err(ShaderError::Unsupported {
             what: "a permlane fetch from lanes outside the host branch",
             ..
@@ -194,7 +194,7 @@ fn permlane_fetch_inactive_after_a_lane_abort_is_rejected() {
         ],
     );
     assert!(matches!(
-        lowered(&native),
+        lowered(&native, false),
         Err(ShaderError::Unsupported {
             what: "a permlane fetch from lanes outside the host branch",
             ..
@@ -204,17 +204,75 @@ fn permlane_fetch_inactive_after_a_lane_abort_is_rejected() {
 
 #[test]
 fn permlane_rows_and_inactive_sources() {
-    check_permlane_rows(false);
+    check_permlane_rows(&[]);
 }
 
 /// FI=0 can execute under a lane-dependent branch: an executing lane
 /// whose source took the other branch keeps its destination or zeroes it.
 #[test]
 fn permlane_fi_zero_under_divergent_exec() {
-    check_permlane_rows(true);
+    // Skip the shuffle when EXEC is empty.
+    check_permlane_rows(&[0xBF88_0002]);
 }
 
-fn check_permlane_rows(divergent: bool) {
+/// Enter the shuffle on the taken EXEC edge, opposite to the skip above.
+#[test]
+fn permlane_on_the_taken_exec_edge() {
+    // s_cbranch_execnz -> shuffle; s_branch -> restore.
+    check_permlane_rows(&[0xBF89_0001, 0xBF82_0002]);
+}
+
+#[test]
+fn warp_permlane_declines_partial_waves_before_dispatch() {
+    for wave64 in [false, true] {
+        let wave = if wave64 { 64 } else { 32 };
+        for threads in [[19, 1, 1], [1, 3, 11], [65, 1, 1], [4, 4, 2], [4, 4, 4]] {
+            let mut program = native(true, false, false, false, wave64, &[]);
+            let StageIo::Cs(io) = &mut program.io else {
+                unreachable!()
+            };
+            io.threads = threads;
+            let result = lowered(&program, true);
+            if threads.into_iter().product::<u32>().is_multiple_of(wave) {
+                result.expect("fully populated software waves");
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ShaderError::Unsupported {
+                        what: "a WARP permlane with a partially populated wave",
+                        ..
+                    })
+                ));
+            }
+            lowered(&program, false).expect("physical adapter translation");
+        }
+    }
+}
+
+#[test]
+fn warp_permlane_declines_an_uncaptured_nested_edge() {
+    // Take an EXEC branch, then a scalar branch, before the shuffle. A
+    // ballot in the second branch cannot recover the entry participation.
+    let program = native(
+        true,
+        false,
+        false,
+        false,
+        false,
+        &[0xBF88_0004, 0xBF06_8000, 0xBF85_0002],
+    );
+    assert!(matches!(
+        lowered(&program, true),
+        Err(ShaderError::Unsupported {
+            what: "a WARP permlane without a known incoming lane mask",
+            ..
+        })
+    ));
+    lowered(&program, false).expect("direct FI=0 under a nested branch");
+}
+
+fn check_permlane_rows(before_shuffle: &[u32]) {
+    let divergent = !before_shuffle.is_empty();
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -261,10 +319,8 @@ fn check_permlane_rows(divergent: bool) {
                 for &fi in fi_cases {
                     for bc in [false, true] {
                         for alias in [false, true] {
-                            // s_cbranch_execz skips the two-dword shuffle to the EXEC restore.
-                            let before: &[u32] = if divergent { &[0xBF88_0002] } else { &[] };
-                            let program = native(cross, fi, bc, alias, wave64, before);
-                            let shader = lowered(&program).expect("lower permlane");
+                            let program = native(cross, fi, bc, alias, wave64, before_shuffle);
+                            let shader = lowered(&program, host.is_software()).expect("lower permlane");
                             let (root, pso) =
                                 host.compute_pipeline(&shader).expect("permlane pipeline");
                             for selectors in [
