@@ -119,22 +119,48 @@ impl Pacer {
     /// the chain, it does not wait), and one late present restarts the
     /// chain from now, so nothing catches up by bursting.
     pub(crate) fn wait(&mut self) {
+        self.wait_with(Instant::now, sleep_until);
+    }
+
+    fn wait_with(
+        &mut self,
+        now: impl FnOnce() -> Instant,
+        wait_until: impl FnOnce(Instant, Option<&std::os::windows::io::OwnedHandle>),
+    ) {
         let Some(period) = self.period else { return };
-        let next = match self.next {
-            Some(next) => {
-                let next = next.max(Instant::now());
-                sleep_until(next, self.timer.as_ref());
-                next
-            }
-            None => Instant::now(),
-        };
-        self.next = Some(next + period);
+        if let Some(deadline) = self.next {
+            wait_until(deadline, self.timer.as_ref());
+        }
+        // A timer wake or the yielding thread can miss the deadline.
+        // Start the next interval when this wait actually completes.
+        self.next = Some(now() + period);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_late_wake_leaves_a_full_period_before_the_next_frame() {
+        use std::cell::Cell;
+        let period = Duration::from_millis(20);
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let mut pacer = Pacer { period: Some(period), timer: None, next: None };
+        let mut frame = |delay_ms| {
+            pacer.wait_with(
+                || clock.get(),
+                |deadline, _| {
+                    clock.set(clock.get().max(deadline) + Duration::from_millis(delay_ms));
+                },
+            );
+            clock.get() - start
+        };
+        for (wake_delay, expected_ms) in [(0, 0), (0, 20), (9, 49), (0, 69), (40, 129), (0, 149)] {
+            assert_eq!(frame(wake_delay), Duration::from_millis(expected_ms));
+        }
+    }
 
     #[test]
     fn the_fps_value_must_be_a_cadence() {
