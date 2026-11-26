@@ -487,34 +487,8 @@ fn root_views_read_their_copy_and_zeros_past_it() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
-/// Writes through unordered buffer views mark their pages (`emit`, "Write
-/// marks"): a dword store and a 16-byte store through view 0 (base bit 100,
-/// its first byte 16 bytes before a 64 KiB page ends, so the second store
-/// crosses into the next page), a store through view 1 (not marked) and an
-/// atomic add through view 2 (base bit 200). The stores land; exactly bits
-/// 100, 101 and 200 are set.
-#[test]
-fn writes_through_views_mark_their_pages() {
-    /// MUBUF `op` of `vdata` at `byte_off` through `s[srsrc:srsrc+3]`.
-    const fn mubuf(op: u32, vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
-        [
-            0x38 << 26 | op << 18 | (byte_off as u32 & 0xFFF),
-            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
-        ]
-    }
-    const BUFFER_STORE_DWORDX4: u32 = 0x1E;
-    const BUFFER_ATOMIC_ADD: u32 = 0x32;
-    let mut w = vec![s_mov_b32(5, ZERO as u8)];
-    for (k, sdata) in [8u8, 12, 16].into_iter().enumerate() {
-        w.extend(s_load(2, sdata, 4, 32 * k as u32));
-    }
-    w.push(S_WAITCNT_ALL);
-    w.extend((0..4).map(|v| v_mov_b32(v, 0)));
-    w.extend(buffer_store_dword(0, 8, 0));
-    w.extend(mubuf(BUFFER_STORE_DWORDX4, 0, 8, 12));
-    w.extend(buffer_store_dword(0, 12, 4));
-    w.extend(mubuf(BUFFER_ATOMIC_ADD, 0, 16, 8));
-    w.push(S_ENDPGM);
+/// Builds a compute shader with a descriptor table and the view-mark roots.
+fn marked_view_shader(w: &[u32], threads: u32, views: u32) -> HostShader {
     let param = |root, user_data, sgprs, slot| RootParam {
         root,
         table_offset_dwords: 0,
@@ -538,10 +512,10 @@ fn writes_through_views_mark_their_pages() {
         wave64: false,
         vgprs: 8,
         layout: vec![param(RootType::Constants, 0, 4, 0), param(RootType::Table, 4, 1, 1)],
-        used: (0..3).map(uav).collect(),
+        used: (0..views).map(uav).collect(),
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1,
-            threads: [1, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -582,6 +556,38 @@ fn writes_through_views_mark_their_pages() {
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
     }
+    shader
+}
+
+/// Writes through unordered buffer views mark their pages (`emit`, "Write
+/// marks"): a dword store and a 16-byte store through view 0 (base bit 100,
+/// its first byte 16 bytes before a 64 KiB page ends, so the second store
+/// crosses into the next page), a store through view 1 (not marked) and an
+/// atomic add through view 2 (base bit 200). The stores land; exactly bits
+/// 100, 101 and 200 are set.
+#[test]
+fn writes_through_views_mark_their_pages() {
+    /// MUBUF `op` of `vdata` at `byte_off` through `s[srsrc:srsrc+3]`.
+    const fn mubuf(op: u32, vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+        [
+            0x38 << 26 | op << 18 | (byte_off as u32 & 0xFFF),
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+        ]
+    }
+    const BUFFER_STORE_DWORDX4: u32 = 0x1E;
+    const BUFFER_ATOMIC_ADD: u32 = 0x32;
+    let mut w = vec![s_mov_b32(5, ZERO as u8)];
+    for (k, sdata) in [8u8, 12, 16].into_iter().enumerate() {
+        w.extend(s_load(2, sdata, 4, 32 * k as u32));
+    }
+    w.push(S_WAITCNT_ALL);
+    w.extend((0..4).map(|v| v_mov_b32(v, 0)));
+    w.extend(buffer_store_dword(0, 8, 0));
+    w.extend(mubuf(BUFFER_STORE_DWORDX4, 0, 8, 12));
+    w.extend(buffer_store_dword(0, 12, 4));
+    w.extend(mubuf(BUFFER_ATOMIC_ADD, 0, 16, 8));
+    w.push(S_ENDPGM);
+    let shader = marked_view_shader(&w, 1, 3);
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -622,6 +628,68 @@ fn writes_through_views_mark_their_pages() {
             .collect();
         assert_eq!(marked, [100, 101, 200], "{label}: pages");
         ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Three participating lane classes write different pages of one view.
+/// The first physical lane is masked, and page bits 31..33 cross a word.
+#[test]
+fn divergent_view_writes_mark_each_page_in_partial_groups() {
+    let mut w = vec![s_mov_b32(5, ZERO as u8)];
+    w.extend(s_load(2, 8, 4, 0));
+    w.extend([
+        S_WAITCNT_ALL,
+        0x3602_0083, // v1 = tid & 3 (page)
+        0x3404_0290, // v2 = page << 16
+        0x3406_0082, // v3 = tid << 2
+        0x4A08_0503, // v4 = v3 + v2 (byte address)
+        v_mov_b32(5, 0),
+        0x7D8A_0280, // v_cmp_ne_u32 vcc, 0, v1
+        0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+        0xE070_1000,
+        0x8002_0504, // buffer_store_dword v5, v4, s[8:11], 0 offen
+        S_ENDPGM,
+    ]);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let value = 0x1234_5678;
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        for threads in [1, 3, 7, 31, 32, 33, 63, 64, 65] {
+            let shader = marked_view_shader(&w, threads, 1);
+            let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+            let mut ud = vec![0; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
+                if u.root == RootType::Constants { ud[u.index as usize] = value; }
+            }
+            let words = 3 * (65536 / 4) + threads;
+            let out = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![
+                    (0, Root::Constants(ud)),
+                    (1, Root::View { srv: true, data: vec![30, 0] }),
+                    (2, Root::Uav(3)),
+                ],
+                views: &[View::RawUav(words)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            }).unwrap_or_else(|e| panic!("{label}, {threads} threads: {e}"));
+            let mut want = vec![0; words as usize];
+            let mut bits = [0u32; 3];
+            for tid in 0..threads {
+                let page = tid & 3;
+                if page != 0 {
+                    want[(page * (65536 / 4) + tid) as usize] = value;
+                    let bit = 30 + page;
+                    bits[(bit / 32) as usize] |= 1 << (bit % 32);
+                }
+            }
+            let mismatch = out[0].iter().zip(&want).position(|(got, expected)| got != expected);
+            assert_eq!(out[0].len(), want.len());
+            assert_eq!(mismatch, None, "{label}, {threads} threads: first wrong store");
+            assert_eq!(out[1], bits, "{label}, {threads} threads: page bitmap");
+            ran += 1;
+        }
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
