@@ -52,7 +52,7 @@ pub enum Atom {
     Lane(Value),
     /// An SCC value, the same in every lane.
     Uniform(Value),
-    /// Scalar VCC != 0, shared by the wave. The two values are the same in Wave32.
+    /// Wave-wide nonzero test for VCC or EXEC guarding a scalar VCC write. The two values are the same in Wave32.
     VccNonzero(Value, Value),
     /// A lane mask joined at a block entry, by its low dword's phi.
     Phi(Value),
@@ -529,9 +529,10 @@ type Key = (Value, Value);
 
 struct Lanes<'a> {
     p: &'a Program,
-    /// Graphics stages use their existing per-lane fallback for VCC derived
-    /// from a lane mask. Keep that mask available to range and path analysis.
-    per_lane_vcc: bool,
+    /// Stage-specific branch semantics. Graphics uses per-lane VCC for
+    /// derived masks, compute can read a scalar mask across the guest wave.
+    stage: Option<HwStage>,
+    acyclic: bool,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -597,10 +598,14 @@ impl<'a> Lanes<'a> {
         }
         check_reducible(p, &order, &index)?;
         let mut incoming = vec![Vec::new(); blocks.len()];
+        let mut acyclic = true;
         let (mut defs, mut phis) = (Map::default(), Map::default());
         for (b, block) in blocks.iter().enumerate() {
             for (k, s) in block.exit.successors().into_iter().enumerate() {
                 incoming[s].push((b, k == 0));
+                if index[b] != usize::MAX && index[s] <= index[b] {
+                    acyclic = false;
+                }
             }
             for (i, phi) in block.phis.iter().enumerate() {
                 phis.insert(phi.value, (b, i));
@@ -613,7 +618,8 @@ impl<'a> Lanes<'a> {
         }
         let mut l = Lanes {
             p,
-            per_lane_vcc: matches!(stage, Some(HwStage::Ps | HwStage::Vs | HwStage::Ms)),
+            stage,
+            acyclic,
             order,
             index,
             incoming,
@@ -773,7 +779,7 @@ impl<'a> Lanes<'a> {
             if let Exit::Branch { taken, not_taken } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
-                let mut w = self.branch(last);
+                let mut w = self.branch(b, last);
                 // A discard's "no lane is left" exit: no lane takes it (the
                 // live mask keeps every lane, see `kills`).
                 if last
@@ -1336,9 +1342,66 @@ impl<'a> Lanes<'a> {
         false
     }
 
+    /// One arm assigns a constant VCC word, the other skips it, and the
+    /// reconverged block branches on that word. Vector code and loops still
+    /// use the ordinary per-lane CFG.
+    fn guards_scalar_vcc_write(&self, guard: usize) -> bool {
+        let Exit::Branch { taken, not_taken } = self.p.blocks[guard].exit else {
+            return false;
+        };
+        [(taken, not_taken), (not_taken, taken)]
+            .into_iter()
+            .any(|(writer, join)| {
+                let write = &self.p.blocks[writer];
+                let merge = &self.p.blocks[join];
+                let [inst] = write.insts.as_slice() else {
+                    return false;
+                };
+                let Some(branch) = merge.insts.last() else {
+                    return false;
+                };
+                let Fields::Sop {
+                    dst: Some(Operand::Scalar { code, dwords }),
+                    src,
+                    ..
+                } = &inst.fields
+                else {
+                    return false;
+                };
+                write.preds == [guard]
+                    && write.exit == Exit::Jump(join)
+                    && merge.preds.len() == 2
+                    && join != guard
+                    && matches!(inst.name(), "s_mov_b32" | "s_mov_b64")
+                    && match src.as_slice() {
+                        [Operand::Literal(_)] => true,
+                        [Operand::Const(c)] => crate::resource::inline(*c).is_some(),
+                        _ => false,
+                    }
+                    && (*code == VCC || *code == VCC + 1 && *dwords == 1)
+                    && matches!(branch.name(), "s_cbranch_vccz" | "s_cbranch_vccnz")
+                    && merge.phis.iter().any(|phi| {
+                        phi.reg == Reg::S(*code) && branch.read(phi.reg) == Some(phi.value)
+                    })
+            })
+    }
+
     /// The per-lane condition under which a block's closing branch is taken.
-    fn branch(&mut self, inst: &Inst) -> Bool {
-        let exec = self.exec(inst);
+    fn branch(&mut self, block: usize, inst: &Inst) -> Bool {
+        let exec = if matches!(inst.name(), "s_cbranch_execz" | "s_cbranch_execnz")
+            && self.stage == Some(HwStage::Cs)
+            && self.acyclic
+            && self.first[block] == Bool::TRUE
+            && self.guards_scalar_vcc_write(block)
+            && let Some((lo, hi)) = self.key(|r| inst.read(r), EXEC)
+        {
+            // The console executes the scalar assignment once if its branch
+            // runs. Every host lane must therefore follow the same edge.
+            let born = self.born(lo).max(self.born(hi));
+            self.b.atom(Atom::VccNonzero(lo, hi), born)
+        } else {
+            self.exec(inst)
+        };
         match inst.name() {
             "s_cbranch_execz" => self.b.not(exec),
             "s_cbranch_execnz" => exec,
@@ -1351,7 +1414,14 @@ impl<'a> Lanes<'a> {
                         match self.immediate_mask(k) {
                             Some(false) => Bool::FALSE,
                             Some(true) => Bool::TRUE,
-                            None if self.per_lane_vcc && derived => mask,
+                            None if derived
+                                && matches!(
+                                    self.stage,
+                                    Some(HwStage::Ps | HwStage::Vs | HwStage::Ms)
+                                ) =>
+                            {
+                                mask
+                            }
                             None if self.uniform_entry_subset(k, mask) => mask,
                             _ => {
                                 let born = self.born(k.0).max(self.born(k.1));

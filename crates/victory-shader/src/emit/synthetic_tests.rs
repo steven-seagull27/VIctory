@@ -16,7 +16,7 @@ use crate::{io, range, resource};
 /// Per lane (32, wave32): the record [offset word, u, v, level] at entry 1
 /// of the table at s0 (a 2D texture at entry 0, a raw UAV at entry 2); the
 /// level converted from an integer (so it is whole). Gathers red at the
-/// level, with the offset, and at level 0 (`lz`) into 12 dwords at lane × 48.
+/// level, with the offset, and at level 0 (`lz`) into 12 dwords at lane Ă— 48.
 fn program(whole: bool) -> Vec<u32> {
     let mut w = vec![
         0xBE84_0300, // s_mov_b32 s4, s0
@@ -155,7 +155,7 @@ fn first(u: f32, size: u32) -> i64 {
 
 #[test]
 fn gathers_at_a_level_match_the_hardware() {
-    // 24×16 then 12×8, 6×4, 3×2; red = level × 1000 + y × 32 + x + 1.
+    // 24Ă—16 then 12Ă—8, 6Ă—4, 3Ă—2; red = level Ă— 1000 + y Ă— 32 + x + 1.
     let mut texels = Vec::new();
     for l in 0..4 {
         let (w, h) = (24 >> l, 16 >> l);
@@ -292,7 +292,7 @@ fn gathers_at_a_level_that_may_be_a_fraction_stop() {
 
 #[test]
 fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
-    // Lanes below 24 run the permute; each reads lane (13 × lane + 5) mod 32
+    // Lanes below 24 run the permute; each reads lane (13 Ă— lane + 5) mod 32
     // (its address in dwords, offset 20 bytes) of 1000 + lane.
     let shader = build(&[
         0xBE84_0300, // s_mov_b32 s4, s0
@@ -795,18 +795,24 @@ fn vcc_branches_take_one_scalar_path_for_the_wave() {
 /// Two full guest waves in one group independently choose their scalar path.
 #[test]
 fn vcc_branches_isolate_two_full_guest_waves() {
-    check_group_vcc_branches(&[(32, 64), (64, 128)]);
+    check_group_vcc_branches(&[(32, 64), (64, 128)], VccInput::Compare);
 }
 
 /// The last real invocation can set VCC in a partially occupied second wave.
 #[test]
 fn vcc_branches_isolate_a_partial_second_guest_wave() {
-    check_group_vcc_branches(&[(32, 45), (64, 85)]);
+    check_group_vcc_branches(&[(32, 45), (64, 85)], VccInput::Compare);
 }
 
-/// A runtime root constant selects the only invocation that sets VCC. Narrow
-/// EXEC to lane 1 of each wave, then restore it to observe every lane's result.
-fn check_group_vcc_branches(groups: &[(u32, u32)]) {
+#[derive(Clone, Copy)]
+enum VccInput {
+    Compare,
+    GuardedMove { skip_zero: bool, high_word: bool },
+}
+
+/// A runtime root constant selects the only invocation that sets the compare
+/// result or enables the scalar assignment. Restore EXEC for the readback.
+fn check_group_vcc_branches(groups: &[(u32, u32)], input: VccInput) {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -824,7 +830,7 @@ fn check_group_vcc_branches(groups: &[(u32, u32)]) {
             for (name, branch, nonzero) in
                 [("vccz", 0xbf86_0001, false), ("vccnz", 0xbf87_0001, true)]
             {
-                let mut native = compute_program(&[
+                let mut words = vec![
                     0xbe84_0300,
                     0xbe85_0380, // s[4:5] = descriptor table
                     0xf408_0a02,
@@ -832,8 +838,22 @@ fn check_group_vcc_branches(groups: &[(u32, u32)]) {
                     0x3420_0082,                    // v16 = 4 * group thread id
                     0x3622_0000 | (128 + wave - 1), // v17 = group thread id & (wave - 1)
                     0xbe90_038b,                    // s16 = 11 (taken)
-                    0x7d84_0002,                    // v_cmp_eq_u32 vcc, s2, v0
-                    0x7da4_2281,                    // v_cmpx_eq_u32 exec, 1, v17
+                ];
+                if let VccInput::GuardedMove { skip_zero, high_word } = input {
+                    // Set VCC exactly when EXEC contains the runtime-selected
+                    // invocation. Both EXECZ and EXECNZ guard encodings do it.
+                    let mov_word = if high_word { 0xbeeb_0380 } else { 0xbeea_0380 };
+                    words.push(if wave == 64 { 0xbeea_0480 } else { 0xbeea_0380 });
+                    words.extend([
+                        mov_word | u32::from(!skip_zero),
+                        0x7da4_0002, // exec = group thread id == s2
+                        if skip_zero { 0xbf88_0001 } else { 0xbf89_0001 },
+                        mov_word | u32::from(skip_zero),
+                    ]);
+                } else {
+                    words.extend([0x7d84_0002, 0x7da4_2281]); // VCC = target; EXEC = local lane 1
+                }
+                words.extend([
                     branch,
                     0xbe90_0397, // s16 = 23 (fallthrough)
                     if wave == 64 { 0xbefe_04c1 } else { 0xbefe_03c1 }, // restore EXEC
@@ -843,6 +863,7 @@ fn check_group_vcc_branches(groups: &[(u32, u32)]) {
                     0x800a_0310, // store v3 at 4 * group thread id
                     0xbf81_0000,
                 ]);
+                let mut native = compute_program(&words);
                 native.wave64 = wave == 64;
                 native.io = StageIo::Cs(ComputeIo {
                     rsrc2: 3 << 1,
@@ -944,6 +965,22 @@ fn supports_guest_wave(host: &Host, adapter: &str, wave: u32) -> bool {
 /// A scalar write inside an EXEC-shaped branch is visible to the whole
 /// guest wave. A normal DXIL phi would retain it only in the writing lanes.
 #[test]
+fn vcc_scalar_write_guarded_by_exec_is_wave_uniform() {
+    for skip_zero in [true, false] {
+        check_group_vcc_branches(
+            &[(32, 64), (32, 45), (64, 128), (64, 85)],
+            VccInput::GuardedMove { skip_zero, high_word: false },
+        );
+        check_group_vcc_branches(
+            &[(64, 128), (64, 85)],
+            VccInput::GuardedMove { skip_zero, high_word: true },
+        );
+    }
+}
+
+/// A divergent arm also consuming its per-lane vector input is outside the
+/// scalar-assignment case.
+#[test]
 fn vcc_from_a_divergent_scalar_join_is_refused() {
     let result = build(&[
         0xbe84_0300, 0xbe85_0380, // s[4:5] = descriptor table
@@ -951,7 +988,8 @@ fn vcc_from_a_divergent_scalar_join_is_refused() {
         0x3420_0082, // v16 = 4 * lane
         0xbeea_0380, // s_mov_b32 vcc_lo, 0
         0x7da4_0080, // exec = lane == 0
-        0xbf88_0001, // s_cbranch_execz skips the scalar write
+        0xbf88_0002, // s_cbranch_execz skips a per-lane operation and the scalar write
+        0x7e02_0300, // v_mov_b32 v1, v0
         0xbeea_0381, // s_mov_b32 vcc_lo, 1
         0xbefe_03c1, // restore EXEC
         0xbe90_038b, // s16 = 11
