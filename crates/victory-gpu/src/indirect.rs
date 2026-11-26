@@ -157,8 +157,12 @@ uint compute_clamped(uint kind, uint src_at, out uint2 draw_counts, out uint3 gr
         groups = g;
         return g.x * g.y * g.z * 64u;
     } else {
+        static const uint MESH_GROUPS = 65535u;
         uint3 g = src_args.Load3(src_at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        if (any(g > MESH_GROUPS)
+                || (g.z != 0 && g.x * g.y > MESH_GROUPS / max(g.z, 1u))) {
+            g = min(g, uint3(MESH_GROUPS, 1u, 1u));
+        }
         groups = g;
         return g.x * g.y * g.z * 128u;
     }
@@ -1027,8 +1031,8 @@ mod tests {
                 _ => {
                     // First mesh tests 65,535 clamp; remaining stay small so BUDGET crosses in the tail.
                     put(&mut initial, cur, if i == 3 { 70_000 } else { 8 + (i % 5) });
-                    put(&mut initial, cur + 4, 4); // clamps to 1
-                    put(&mut initial, cur + 8, 3); // clamps to 1
+                    put(&mut initial, cur + 4, 4);
+                    put(&mut initial, cur + 8, 3);
                 }
             }
             specs.push(Spec {
@@ -1137,6 +1141,10 @@ mod tests {
                 (0..*bytes / 4).map(|i| p.add(i).read_volatile()).collect::<Vec<_>>()
             };
             assert_eq!(got, expected, "job {idx} hoisted output must match inline bound()");
+            if idx == 7 {
+                // The first in-range mesh job retains its original three group counts.
+                assert_eq!(got, [10, 4, 3]);
+            }
             if idx >= 76 {
                 if got[0] == 1_000_000 {
                     tail_kept += 1;
