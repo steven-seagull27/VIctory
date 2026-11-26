@@ -11,41 +11,77 @@
 //! components past the end of the vertex (an element that reaches into the
 //! next one, which the layout allows).
 
-/// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
-/// vertices each in `dst`: `(v0, v1, v2)` and `(va, vb, v3)`, so both
-/// triangles turn the same way, with the right angle `vc` picked from the
-/// first float element of two or more components (taken as the position;
-/// none: at `v1`), `va` before it, `vb` after it and `v3 = va + vb - vc`.
-/// `elements` are (byte offset, format).
-pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+/// The float2-or-wider input used by the CPU fallback to identify the right
+/// angle. All per-vertex streams of a draw share that corner order.
+#[derive(Clone, Copy)]
+pub(crate) struct RectPosition {
+    stride: usize,
+    offset: usize,
+    kind: Kind,
+}
+
+impl RectPosition {
+    pub(crate) fn new(stride: usize, offset: u32, format: u32) -> Option<Self> {
+        let offset = offset as usize;
+        let (n, kind) = components(format)?;
+        (matches!(kind, Kind::F32 | Kind::F16)
+            && n >= 2
+            && stride.saturating_sub(offset) / kind.bytes() >= 2)
+            .then_some(Self {
+                stride,
+                offset,
+                kind,
+            })
+    }
+
+    pub(crate) fn right_angles(self, src: &[u8]) -> Vec<u8> {
+        let Some(rect_bytes) = self.stride.checked_mul(3) else {
+            return Vec::new();
+        };
+        src.chunks_exact(rect_bytes)
+            .map(|rect| {
+                let xy = [0, 1, 2].map(|i| {
+                    let at = &rect[i * self.stride + self.offset..];
+                    [self.kind.read(at, 0), self.kind.read(at, 1)]
+                });
+                victory_shader::emit::right_angle(xy) as u8
+            })
+            .collect()
+    }
+}
+
+/// Split through v0 so its flat attributes lead both triangles, as in the
+/// geometry shader. Layouts without a usable position assume v1 is the
+/// right angle.
+pub(crate) fn expand_rect_stream(
+    src: &[u8],
+    dst: &mut [u8],
+    stride: usize,
+    elements: &[(u32, u32)],
+    angles: &[u8],
+) {
     if stride == 0 {
         return;
     }
     let (Some(in_rect), Some(out_rect)) = (stride.checked_mul(3), stride.checked_mul(6)) else {
         return;
     };
-    for (rect, out) in src
+    for (index, (rect, out)) in src
         .chunks_exact(in_rect)
         .zip(dst.chunks_exact_mut(out_rect))
+        .enumerate()
     {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
-        let right = elements
-            .iter()
-            .find_map(|&(offset, format)| {
-                let at = offset as usize;
-                let (n, kind) = components(format)?;
-                let float = matches!(kind, Kind::F32 | Kind::F16);
-                (float && n >= 2 && stride.saturating_sub(at) / kind.bytes() >= 2).then(|| {
-                    victory_shader::emit::right_angle([0, 1, 2].map(|i| [0, 1].map(|k| kind.read(&v(i)[at..], k))))
-                })
-            })
-            .unwrap_or(1);
+        let right = usize::from(angles.get(index).copied().unwrap_or(1));
         let (a, b) = ((right + 2) % 3, (right + 1) % 3);
-        for (slot, i) in [0, 1, 2, a, b].into_iter().enumerate() {
-            out[slot * stride..(slot + 1) * stride].copy_from_slice(v(i));
-        }
-        let fourth = &mut out[5 * stride..];
-        fourth.copy_from_slice(v(a));
+        let (order, fourth_slot) = match right {
+            0 => ([0, 1, 3, 0, 3, 2], 2),
+            2 => ([0, 1, 2, 0, 3, 1], 4),
+            _ => ([0, 1, 2, 0, 2, 3], 5),
+        };
+        let fourth_range = fourth_slot * stride..(fourth_slot + 1) * stride;
+        let fourth = &mut out[fourth_range.clone()];
+        fourth.copy_from_slice(v(0));
         for &(offset, format) in elements {
             let at = offset as usize;
             let Some((n, kind)) = components(format) else {
@@ -58,6 +94,13 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
                 let get = |i: usize| kind.read(&v(i)[at..], c);
                 let value = get(a) + get(b) - get(right);
                 kind.write(&mut fourth[at..], c, value);
+            }
+        }
+        for (slot, &corner) in order.iter().enumerate() {
+            if corner < 3 {
+                out[slot * stride..(slot + 1) * stride].copy_from_slice(v(corner));
+            } else if slot != fourth_slot {
+                out.copy_within(fourth_range.clone(), slot * stride);
             }
         }
     }
@@ -188,6 +231,14 @@ fn f32_to_half(v: f32) -> u16 {
 mod tests {
     use super::*;
 
+    fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+        let angles = elements
+            .iter()
+            .find_map(|&(offset, format)| RectPosition::new(stride, offset, format))
+            .map_or_else(Vec::new, |position| position.right_angles(src));
+        expand_rect_stream(src, dst, stride, elements, &angles);
+    }
+
     /// A rectangle of float2 positions and RGBA8 colors, given as top
     /// left, bottom left, bottom right: the fourth corner completes the
     /// parallelogram at the top right.
@@ -219,7 +270,7 @@ mod tests {
 
     /// The tiled lighting's order (top left, bottom left, top right: the
     /// right angle first) completes at the bottom right, the second
-    /// triangle (v2, v1, v3); a triangle that is no rectangle's keeps its
+    /// triangle (v0, v3, v2); a triangle that is no rectangle's keeps its
     /// winding in both halves.
     #[test]
     fn rectangles_complete_opposite_their_right_angle() {
@@ -227,9 +278,14 @@ mod tests {
         let src = [vertex(0.0, 0.0), vertex(0.0, 1.0), vertex(1.0, 0.0)].concat();
         let mut dst = vec![0u8; 6 * 8];
         expand_rects(&src, &mut dst, 8, &[(0, 16)]);
-        assert_eq!(dst[24..], [&src[16..24], &src[8..16], &vertex(1.0, 1.0)[..]].concat()[..]);
+        assert_eq!(
+            dst[24..],
+            [&src[..8], &vertex(1.0, 1.0)[..], &src[16..24]].concat()[..]
+        );
         let read = |d: &[u8], i: usize| {
-            let f = |k: usize| f32::from_le_bytes(d[i * 8 + k * 4..i * 8 + k * 4 + 4].try_into().unwrap());
+            let f = |k: usize| {
+                f32::from_le_bytes(d[i * 8 + k * 4..i * 8 + k * 4 + 4].try_into().unwrap())
+            };
             [f(0), f(1)]
         };
         let turn = |d: &[u8], i: usize| {
@@ -239,6 +295,43 @@ mod tests {
         let src = [vertex(0.0, 0.0), vertex(3.0, 1.0), vertex(1.0, 0.0)].concat();
         expand_rects(&src, &mut dst, 8, &[(0, 16)]);
         assert!(turn(&dst, 0) * turn(&dst, 3) > 0.0, "same winding");
+    }
+
+    #[test]
+    fn split_streams_keep_flat_attributes_and_share_the_diagonal() {
+        let (tl, bl, tr) = ([0f32, 0.0], [0.0, 1.0], [1.0, 0.0]);
+        let positions: Vec<_> = [[tl, bl, tr], [tr, tl, bl], [bl, tr, tl]]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let angles = RectPosition::new(8, 0, 16)
+            .unwrap()
+            .right_angles(&positions);
+        assert_eq!(angles, [0, 1, 2]);
+        // A separate stream has only an integer tag and one float attribute.
+        // Its fourth tag comes from v0; the float uses the shared right angle.
+        let attr = |tag: u32, value: f32| [tag.to_le_bytes(), value.to_le_bytes()].concat();
+        let attrs: Vec<u8> = [2u32, 4, 9]
+            .into_iter()
+            .cycle()
+            .take(9)
+            .flat_map(|x| attr(x, x as f32))
+            .collect();
+        let mut expanded = [0; 18 * 8];
+        expand_rect_stream(&attrs, &mut expanded, 8, &[(0, 42), (4, 41)], &angles);
+        let (a, b, c) = (attr(2, 2.0), attr(4, 4.0), attr(9, 9.0));
+        let (d0, d1, d2) = (attr(2, 11.0), attr(2, 7.0), attr(2, -3.0));
+        for (rect, expected) in expanded.as_chunks::<48>().0.iter().zip([
+            [&a, &b, &d0, &a, &d0, &c],
+            [&a, &b, &c, &a, &c, &d1],
+            [&a, &b, &c, &a, &d2, &b],
+        ]) {
+            for (record, vertex) in rect.as_chunks::<8>().0.iter().zip(expected) {
+                assert_eq!(record.as_slice(), vertex.as_slice());
+            }
+        }
     }
 
     /// A rounding that carries out of the mantissa raises the exponent

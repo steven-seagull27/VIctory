@@ -295,7 +295,8 @@ impl GraphicsState {
         let mut next = [0u32; 32];
         self.inputs
             .iter()
-            .map(|e| {
+            .enumerate()
+            .map(|(index, e)| {
                 let slot = e.InputSlot.min(31) as usize;
                 let format = e.Format.0 as u32;
                 let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
@@ -313,6 +314,10 @@ impl GraphicsState {
                 next[slot] = offset.saturating_add(bytes);
                 Input {
                     slot: slot as u32,
+                    position: self.names.get(index).is_some_and(|n| {
+                        n.as_bytes().eq_ignore_ascii_case(b"POSITION")
+                            || n.as_bytes().eq_ignore_ascii_case(b"SV_Position")
+                    }),
                     offset,
                     format,
                     per_instance: e.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
@@ -329,6 +334,7 @@ pub(crate) struct Input {
     pub(crate) offset: u32,
     pub(crate) format: u32,
     pub(crate) per_instance: bool,
+    pub(crate) position: bool,
 }
 
 /// The console's own primitive topology types.
@@ -1002,6 +1008,20 @@ mod tests {
             ..GraphicsState::default()
         };
         state.elements().iter().map(|e| e.offset).collect()
+    }
+
+    #[test]
+    fn rectangle_layout_recognizes_named_positions_after_other_streams() {
+        let uv = element(DXGI_FORMAT_R32G32_FLOAT, 0);
+        let position = D3D12_INPUT_ELEMENT_DESC { InputSlot: 1, ..uv };
+        let state = GraphicsState {
+            inputs: vec![uv, position],
+            names: vec![c"TEXCOORD".to_owned(), c"position".to_owned()],
+            ..GraphicsState::default()
+        };
+        let inputs = state.elements();
+        assert!(!inputs[0].position);
+        assert!(inputs[1].position);
     }
 
     /// An appended element after one of 1 or 2 bytes started right after

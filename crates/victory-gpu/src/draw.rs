@@ -1607,6 +1607,18 @@ impl State {
             return false;
         };
         let rects = u64::from(count / 3);
+        let position = p
+            .inputs
+            .iter()
+            .filter(|e| !e.per_instance)
+            .filter_map(|e| {
+                let v = self.vertex[e.slot as usize];
+                let pos =
+                    crate::primitive::RectPosition::new(v.stride as usize, e.offset, e.format)?;
+                Some((!e.position, v, pos))
+            })
+            .min_by_key(|&(unnamed, _, _)| unnamed);
+        let mut streams = Vec::new();
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
                 .inputs
@@ -1619,39 +1631,55 @@ impl State {
             }
             let v = self.vertex[slot as usize];
             let stride = u64::from(v.stride);
-            let from = v.address + u64::from(first) * stride;
+            let Some(from) = v.address.checked_add(u64::from(first) * stride) else {
+                return false;
+            };
             if v.address == 0
                 || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
+                || u64::from(first) + u64::from(count) > u64::from(v.size) / stride
                 || crate::shadow::find(from, rects * 3 * stride).is_none()
             {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
             }
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+            let Ok(size) = u32::try_from(rects * 6 * stride) else {
+                return false;
+            };
+            let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
+            streams.push((from, to, stride, elements));
+            let view = D3D12_VERTEX_BUFFER_VIEW {
+                BufferLocation: gpu,
+                SizeInBytes: size,
+                StrideInBytes: v.stride,
+            };
+            // SAFETY: an open list; the view names live scratch memory.
+            unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
+        }
+        list.defer_host(move || {
             let n = rects as usize;
-            list.defer_host(move || {
-                // SAFETY: the vertices lie in a title buffer (checked when
-                // recorded) and the scratch memory is the list's.
+            let angles = position.map_or_else(Vec::new, |(_, v, pos)| {
+                let from = v.address + u64::from(first) * u64::from(v.stride);
+                // SAFETY: all per-vertex source ranges were checked above.
+                let src = unsafe {
+                    std::slice::from_raw_parts(from as *const u8, n * 3 * v.stride as usize)
+                };
+                pos.right_angles(src)
+            });
+            for &(from, to, stride, ref elements) in &streams {
+                // SAFETY: the source is a checked title buffer and the
+                // destination is this stream's allocation in list scratch.
                 let (src, dst) = unsafe {
                     (
                         std::slice::from_raw_parts(from as *const u8, n * 3 * stride),
                         std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
                     )
                 };
-                crate::primitive::expand_rects(src, dst, stride, &elements);
-            });
-            let view = D3D12_VERTEX_BUFFER_VIEW {
-                BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
-                StrideInBytes: v.stride,
-            };
-            // SAFETY: an open list; the view names live scratch memory.
-            unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
-        }
+                crate::primitive::expand_rect_stream(src, dst, stride, elements, &angles);
+            }
+        });
         true
     }
 
