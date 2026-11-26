@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{self, EXEC, Inst, M0, Program, Reg, Value};
+use crate::native::{HwStage, NativeProgram};
 use crate::structure::{self, Atom, LaneExit, Structured};
 
 /// [`ir::build`] and [`structure::structure`], built again with the register
@@ -38,8 +39,26 @@ pub fn build(
     wave64: bool,
     vgprs: u16,
 ) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
+    build_in_stage(code, wave64, vgprs, None)
+}
+
+/// Build the code and branch conditions used by this shader stage, including
+/// the same VCC decision used when lowering graphics programs to DXIL.
+pub fn build_native(
+    native: &NativeProgram,
+) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
+    build_in_stage(&native.patched_code(), native.wave64, native.vgprs, Some(native.stage))
+}
+
+fn build_in_stage(
+    code: &[u8],
+    wave64: bool,
+    vgprs: u16,
+    stage: Option<HwStage>,
+) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
+    let structure = |p: &Program| structure::structure_as(p, true, stage);
     let p = ir::build(code, wave64, vgprs)?;
-    let st = structure::structure(&p);
+    let st = structure(&p);
     let mut assumed: HashMap<usize, u8> = p
         .blocks
         .iter()
@@ -56,7 +75,7 @@ pub fn build(
             break;
         }
         let q = ir::build_bounded(code, wave64, vgprs, &assumed)?;
-        let Ok(s) = structure::structure(&q) else {
+        let Ok(s) = structure(&q) else {
             break;
         };
         let found = relative_bounds(&q, &s);
@@ -69,7 +88,7 @@ pub fn build(
                 return Ok((q, Ok(s)));
             }
             let q = ir::build_bounded(code, wave64, vgprs, &proven)?;
-            let s = structure::structure(&q);
+            let s = structure(&q);
             return Ok((q, s));
         }
         assumed = assumed
@@ -200,8 +219,14 @@ impl Ranges<'_> {
         atoms.dedup();
         let mut best = u32::MAX;
         for atom in atoms {
-            let (Atom::Lane(c) | Atom::Uniform(c)) = atom else {
-                continue;
+            let c = match atom {
+                Atom::Lane(c) | Atom::Uniform(c) => c,
+                Atom::VccNonzero(lo, hi)
+                    if pred == to && self.uniform_counter_compare(pred, a, lo, hi) =>
+                {
+                    lo
+                }
+                _ => continue,
             };
             if let Some(holds) = self.st.bools.decides(&facts, atom)
                 && let Some(h) = self.compare_bound(c, a, holds)
@@ -210,6 +235,77 @@ impl Ranges<'_> {
             }
         }
         if best == u32::MAX { self.hi(a) } else { best }
+    }
+
+    /// A wave-wide compare can bound every lane's counter on a back edge
+    /// if every lane begins at the same value and takes the same step.
+    /// Recognize a single-block loop entered unconditionally from the entry
+    /// block: its only other incoming edge is the uniform branch to itself.
+    /// Because the entry block runs unconditionally, the initializer sets the
+    /// same constant across all launched lanes; inside the loop, the unguarded
+    /// `v_add_nc_u32` constant step advances every lane together and the
+    /// whole-wave `s_cbranch_vcc*` back edge keeps every lane in lockstep, so
+    /// the compare result is uniform across the wave and bounds `a` in every
+    /// lane equally.
+    fn uniform_counter_compare(&self, header: usize, a: Value, lo: Value, hi: Value) -> bool {
+        let unguarded = |v, block| {
+            let &Def::Inst(b, i) = self.defs.get(&v)? else {
+                return None;
+            };
+            (b == block && self.st.guards[b][i].is_none()).then_some(&self.p.blocks[b].insts[i])
+        };
+        let Some(cmp) = unguarded(lo, header) else {
+            return false;
+        };
+        let block = &self.p.blocks[header];
+        if block.preds.len() != 2
+            || self.p.blocks[0].exit != ir::Exit::Jump(header)
+            || !self.p.blocks[0].preds.is_empty()
+            || (lo != hi && cmp.write(Reg::S(ir::VCC + 1)) != Some(hi))
+        {
+            return false;
+        }
+        let Some(step) = unguarded(a, header) else {
+            return false;
+        };
+        let Fields::Valu(v) = &step.fields else {
+            return false;
+        };
+        if step.name() != "v_add_nc_u32" || v.dpp.is_some() || v.sdwa.is_some() {
+            return false;
+        }
+        let immediate = |op: &Operand| matches!(op, Operand::Const(_) | Operand::Literal(_));
+        let carried = match v.src.as_slice() {
+            [x, y] if immediate(y) => value(step, x),
+            [x, y] if immediate(x) => value(step, y),
+            _ => None,
+        };
+        let Some(Def::Phi(b, i)) = carried.and_then(|c| self.defs.get(&c)).copied() else {
+            return false;
+        };
+        if b != header {
+            return false;
+        }
+        block
+            .preds
+            .iter()
+            .zip(&block.phis[i].args)
+            .all(|(&pred, &arg)| {
+                if pred == header {
+                    return arg == a;
+                }
+                let Some(init) = unguarded(arg, 0) else {
+                    return false;
+                };
+                let Fields::Valu(v) = &init.fields else {
+                    return false;
+                };
+                pred == 0
+                    && init.name() == "v_mov_b32"
+                    && v.sdwa.is_none()
+                    && v.dpp.is_none()
+                    && matches!(v.src.as_slice(), [x] if immediate(x))
+            })
     }
 
     /// What an unsigned compare whose result `c` is `holds` says of the
@@ -222,11 +318,15 @@ impl Ranges<'_> {
         let inst = &p.blocks[b].insts[i];
         let name = inst.name();
         let (op, src) = match &inst.fields {
-            Fields::Valu(v) if v.sdwa.is_none() && v.dpp.is_none() => (
-                name.strip_prefix("v_cmpx_")
-                    .or_else(|| name.strip_prefix("v_cmp_"))?,
-                &v.src,
-            ),
+            Fields::Valu(v)
+                if v.sdwa.is_none() && v.dpp.is_none() && (v.abs | v.neg | v.opsel) == 0 =>
+            {
+                (
+                    name.strip_prefix("v_cmpx_")
+                        .or_else(|| name.strip_prefix("v_cmp_"))?,
+                    &v.src,
+                )
+            }
             Fields::Sop { src, .. } if inst.write(Reg::Scc) == Some(c) => {
                 (name.strip_prefix("s_cmp_")?, src)
             }
@@ -421,6 +521,38 @@ mod tests {
             .find(|i| i.name() == "v_movreld_b32")
             .unwrap();
         assert_eq!(vgprs(&movreld.writes), [2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn a_wave_compare_bounds_only_a_uniform_loop_counter() {
+        for (start, increment, end) in [(128, 129, 6), (V, 129, 16), (128, V, 16)] {
+            let words = [
+                vop1(0x01, 7, start),
+                vop1(0x02, 0, V + 7),
+                M0_S0,
+                vop1(0x42, 2, V),
+                vop2(0x25, 7, increment, 7),
+                0x7C00_0000 | 0xC4 << 17 | 7 << 9 | 132, // v_cmp_gt_u32 vcc, 4, v7
+                0xBF87_FFFA,
+                S_ENDPGM,
+            ];
+            let code: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            for wave64 in [false, true] {
+                let (p, st) = build(&code, wave64, 16).unwrap();
+                st.unwrap();
+                let movreld = p
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .find(|i| i.name() == "v_movreld_b32")
+                    .unwrap();
+                assert_eq!(
+                    vgprs(&movreld.writes),
+                    (2..end).collect::<Vec<_>>(),
+                    "wave64={wave64}"
+                );
+            }
+        }
     }
 
     #[test]

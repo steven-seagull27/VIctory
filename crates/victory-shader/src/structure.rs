@@ -3,13 +3,15 @@
 //!
 //! Lane masks (EXEC, compare and carry results, the SGPRs they are saved
 //! in) become per-lane booleans ([`Bools`]). A branch on a wave-wide test of
-//! a mask (`s_cbranch_execz`, `vccz`, SCC of a mask operation) becomes a
+//! a mask (`s_cbranch_execz`, SCC of a mask operation) becomes a
 //! branch on the lane's own bit: compiled code only skips work that lanes
 //! outside the mask would not change, or tests a value that is the same in
 //! every lane, so either way each lane can decide alone. A path-sensitive
 //! pass then proves, for each vector instruction, that EXEC holds in every
 //! lane that reaches it; what it cannot prove stays as the instruction's
 //! guard, a per-lane `if` around it.
+//! VCC zero/nonzero branches test the whole guest register, including bits
+//! outside the current EXEC mask.
 //!
 //! A pixel's discard (`s_andn2 live, live, exec`, then "no lane is left":
 //! the exit) is the exception: on the console a discarded lane whose quad
@@ -30,6 +32,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
+use crate::native::HwStage;
 use crate::resource::lane_of;
 
 /// A per-lane boolean: a node of [`Bools`]. Equal functions are equal nodes.
@@ -49,6 +52,8 @@ pub enum Atom {
     Lane(Value),
     /// An SCC value, the same in every lane.
     Uniform(Value),
+    /// Scalar VCC != 0, shared by the wave. The two values are the same in Wave32.
+    VccNonzero(Value, Value),
     /// A lane mask joined at a block entry, by its low dword's phi.
     Phi(Value),
     /// `s_wqm` result: some lane of the quad is in the source mask.
@@ -429,7 +434,7 @@ impl Bools {
 pub enum LaneExit {
     Jump(usize),
     /// To `taken` in lanes where `when` holds. A condition over
-    /// [`Atom::Uniform`]s only is a uniform branch.
+    /// [`Atom::Uniform`]s and [`Atom::VccNonzero`]s only is a uniform branch.
     Branch {
         when: Bool,
         taken: usize,
@@ -486,7 +491,7 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, true)
+    structure_as(program, true, None)
 }
 
 /// The per-lane form with a pixel's discarded lanes taken out of the live
@@ -494,11 +499,15 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// what a program needs whose discarded lanes would read values no
 /// surviving lane does (see [`Structured::discards`]).
 pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, false)
+    structure_as(program, false, Some(HwStage::Ps))
 }
 
-fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
-    let mut l = Lanes::new(program)?;
+pub(crate) fn structure_as(
+    program: &Program,
+    helpers: bool,
+    stage: Option<HwStage>,
+) -> Result<Structured, ShaderError> {
+    let mut l = Lanes::new(program, stage)?;
     if !helpers {
         l.kills.clear();
     }
@@ -520,6 +529,9 @@ type Key = (Value, Value);
 
 struct Lanes<'a> {
     p: &'a Program,
+    /// Graphics stages use their existing per-lane fallback for VCC derived
+    /// from a lane mask. Keep that mask available to range and path analysis.
+    per_lane_vcc: bool,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -576,7 +588,7 @@ struct SopMasks {
 const MAX_ROUNDS: usize = 256;
 
 impl<'a> Lanes<'a> {
-    fn new(p: &'a Program) -> Result<Self, ShaderError> {
+    fn new(p: &'a Program, stage: Option<HwStage>) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
         let order = crate::ir::reverse_postorder(blocks);
         let mut index = vec![usize::MAX; blocks.len()];
@@ -601,6 +613,7 @@ impl<'a> Lanes<'a> {
         }
         let mut l = Lanes {
             p,
+            per_lane_vcc: matches!(stage, Some(HwStage::Ps | HwStage::Vs | HwStage::Ms)),
             order,
             index,
             incoming,
@@ -1330,11 +1343,24 @@ impl<'a> Lanes<'a> {
             "s_cbranch_execz" => self.b.not(exec),
             "s_cbranch_execnz" => exec,
             n @ ("s_cbranch_vccz" | "s_cbranch_vccnz") => {
-                let vcc = match self.key(|r| inst.read(r), VCC) {
-                    Some(k) => self.mask(k).0,
+                let any = match self.key(|r| inst.read(r), VCC) {
+                    Some(k) => {
+                        let (mask, derived) = self.mask(k);
+                        // Only fold a known register value. Facts about the
+                        // bits of lanes reaching a join do not describe the whole register.
+                        match self.immediate_mask(k) {
+                            Some(false) => Bool::FALSE,
+                            Some(true) => Bool::TRUE,
+                            None if self.per_lane_vcc && derived => mask,
+                            None if self.uniform_entry_subset(k, mask) => mask,
+                            _ => {
+                                let born = self.born(k.0).max(self.born(k.1));
+                                self.b.atom(Atom::VccNonzero(k.0, k.1), born)
+                            }
+                        }
+                    }
                     None => Bool::FALSE,
                 };
-                let any = self.b.and(vcc, exec);
                 if n.ends_with("nz") {
                     any
                 } else {
@@ -1359,6 +1385,54 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
+    }
+
+    fn immediate_mask(&self, k: Key) -> Option<bool> {
+        let &(b, i) = self.defs.get(&k.0)?;
+        if self.defs.get(&k.1) != Some(&(b, i)) {
+            return None;
+        }
+        let inst = &self.p.blocks[b].insts[i];
+        if !matches!((inst.name(), self.p.wave64), ("s_mov_b32", false) | ("s_mov_b64", true)) {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else { return None };
+        match src.as_slice() {
+            [Operand::Const(code)] => Some(crate::resource::inline(*code)? != 0),
+            [Operand::Literal(bits)] => Some(*bits != 0),
+            _ => None,
+        }
+    }
+
+    /// An AND with the original EXEC in the entry block clears every bit
+    /// outside the launched lanes. If every launched lane's bit is the same
+    /// scalar condition, the whole register is nonzero exactly when it holds.
+    fn uniform_entry_subset(&self, k: Key, mask: Bool) -> bool {
+        let Some(&(b, i)) = self.defs.get(&k.0) else {
+            return false;
+        };
+        let block = &self.p.blocks[b];
+        if self.order.first() != Some(&b)
+            || !block.preds.is_empty()
+            || self.defs.get(&k.1) != Some(&(b, i))
+        {
+            return false;
+        }
+        let inst = &block.insts[i];
+        let width = if self.p.wave64 { "s_and_b64" } else { "s_and_b32" };
+        if inst.name() != width {
+            return false;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return false;
+        };
+        let input = |reg| self.p.inputs.iter().find(|i| i.0 == reg).map(|i| i.1);
+        src.iter().any(|op| matches!(op, Operand::Scalar { code: EXEC, .. }))
+            && self.key(|r| inst.read(r), EXEC)
+                .is_some_and(|e| self.key(input, EXEC) == Some(e))
+            && self.b.support(mask).into_iter().all(|atom| {
+                matches!(atom, Atom::Uniform(scc) if !self.scc_lane.contains_key(&scc))
+            })
     }
 
     /// What a lane knows on entering each block, to a fixpoint. A loop
@@ -1467,6 +1541,35 @@ mod tests {
     }
 
     #[test]
+    fn only_a_uniform_subset_of_entry_exec_avoids_the_whole_vcc_test() {
+        let branch = |prefix: &[u32]| {
+            let mut words = prefix.to_vec();
+            words.extend([0xBF87_0001, 0x7E06_0280, S_ENDPGM]); // vccnz -> end
+            let p = build(&words, true);
+            let s = structure(&p).unwrap();
+            let LaneExit::Branch { when, .. } = s.exits[0] else {
+                panic!("no branch")
+            };
+            s.bools.support(when)
+        };
+        let uniform = branch(&[
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            0x8580_807E, // s_cselect_b64 s[0:1], exec, 0
+            0x87EA_007E, // s_and_b64 vcc, exec, s[0:1]
+        ]);
+        assert!(matches!(uniform.as_slice(), [Atom::Uniform(_)]));
+        let mixed = branch(&[
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0x87EA_6A7E, // s_and_b64 vcc, exec, vcc
+        ]);
+        assert!(matches!(mixed.as_slice(), [Atom::VccNonzero(..)]));
+        // A complement is clear at every entry invocation, but bits for
+        // unlaunched lanes can still make the raw register nonzero.
+        let outside = branch(&[0xBEEA_087E]); // s_not_b64 vcc, exec
+        assert!(matches!(outside.as_slice(), [Atom::VccNonzero(..)]));
+    }
+
+    #[test]
     fn a_mask_spilled_to_a_vgpr_lane_comes_back_as_itself() {
         let p = build(
             &[
@@ -1548,6 +1651,39 @@ mod tests {
         assert_eq!(s.guards[0][0], None, "the compare runs in every lane");
         let g = s.guards[0][1].expect("guard");
         assert!(matches!(s.bools.support(g)[..], [Atom::Lane(_)]));
+    }
+
+    #[test]
+    fn vcc_branch_tests_raw_vcc_without_exec() {
+        for (branch_word, invert) in [(0xBF87_0001_u32, false), (0xBF86_0001_u32, true)] {
+            // v_cmp_eq_u32 vcc, 0, v0
+            // v_cmpx_eq_u32 exec, 0, v1 (narrow EXEC independently of VCC)
+            // s_cbranch_vccnz / s_cbranch_vccz -> target
+            // v_mov_b32 v2, 0
+            // S_ENDPGM
+            let p = build(
+                &[
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0x7DA4_0280, // v_cmpx_eq_u32 exec, 0, v1
+                    branch_word, // s_cbranch_vccnz or s_cbranch_vccz -> +1
+                    0x7E04_0280, // v_mov_b32 v2, 0
+                    S_ENDPGM,
+                ],
+                false,
+            );
+            let s = structure(&p).unwrap();
+            let LaneExit::Branch { when, .. } = s.exits[0] else {
+                panic!("expected branch exit");
+            };
+            let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+            let (lo, hi) = if invert {
+                (Bool::TRUE, Bool::FALSE)
+            } else {
+                (Bool::FALSE, Bool::TRUE)
+            };
+            assert_eq!(s.bools.node(when), Some((Atom::VccNonzero(cmp, cmp), lo, hi)));
+            assert_eq!(s.bools.support(when), vec![Atom::VccNonzero(cmp, cmp)]);
+        }
     }
 
     #[test]
