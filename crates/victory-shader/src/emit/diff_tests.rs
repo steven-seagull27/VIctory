@@ -757,7 +757,7 @@ fn tools() -> Option<(PathBuf, PathBuf)> {
     (console.exists() && pc.exists()).then_some((console, pc))
 }
 
-fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec<u8> {
+pub(super) fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec<u8> {
     let input = dir.join("t.hlsl");
     let output = dir.join(format!("{entry}.bin"));
     let text = if entry == "cs" {

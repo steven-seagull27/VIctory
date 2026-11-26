@@ -407,6 +407,17 @@ impl Host {
         gs: &[u8],
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
+        self.pipeline_samples(root, vs, gs, ps, 1)
+    }
+
+    pub(crate) fn pipeline_samples(
+        &self,
+        root: &ID3D12RootSignature,
+        vs: &[u8],
+        gs: &[u8],
+        ps: &[u8],
+        samples: u32,
+    ) -> Result<ID3D12PipelineState, String> {
         let inputs = sig(vs, FourCC::ISG1)?;
         let names: Vec<CString> = inputs
             .iter()
@@ -455,7 +466,7 @@ impl Host {
             },
             PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
+                Count: samples,
                 Quality: 0,
             },
             ..Default::default()
@@ -961,6 +972,17 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
+        self.draw_samples(root, pso, d, 1)
+    }
+
+    /// Resolves a multisampled RGBA32F render target before reading its pixels.
+    pub(crate) fn draw_samples(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+        samples: u32,
+    ) -> Result<Vec<[f32; 4]>, String> {
         let _guard = self.lock_warp();
         let dev = &self.device;
         let (w, h) = d.size;
@@ -1026,9 +1048,16 @@ impl Host {
                 .map_err(err)?;
                 r.ok_or_else(|| "no resource".to_string())
             };
+            let target_desc = D3D12_RESOURCE_DESC {
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: samples,
+                    Quality: 0,
+                },
+                ..tex_desc(w, h, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+            };
             let target = make(
                 D3D12_HEAP_TYPE_DEFAULT,
-                &tex_desc(w, h, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                &target_desc,
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
                 Some(&D3D12_CLEAR_VALUE {
                     Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
@@ -1176,6 +1205,9 @@ impl Host {
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            if samples > 1 {
+                list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+            }
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
                 Height: h as f32,
@@ -1204,11 +1236,24 @@ impl Host {
             } else {
                 list.DrawInstanced(3, 1, 0, 0);
             }
-            list.ResourceBarrier(&[transition(
-                &target,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
+            let (source, state) = if samples > 1 {
+                let resolved = make(
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    &tex_desc(w, h, D3D12_RESOURCE_FLAG_NONE),
+                    D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                    None,
+                )?;
+                list.ResourceBarrier(&[transition(
+                    &target,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+                )]);
+                list.ResolveSubresource(&resolved, 0, &target, 0, DXGI_FORMAT_R32G32B32A32_FLOAT);
+                (resolved, D3D12_RESOURCE_STATE_RESOLVE_DEST)
+            } else {
+                (target.clone(), D3D12_RESOURCE_STATE_RENDER_TARGET)
+            };
+            list.ResourceBarrier(&[transition(&source, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
             let pitch = (w as usize * 16).next_multiple_of(256);
             let readback = make(
                 D3D12_HEAP_TYPE_READBACK,
@@ -1233,7 +1278,7 @@ impl Host {
                 },
             };
             let src = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&target),
+                pResource: std::mem::transmute_copy(&source),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                     SubresourceIndex: 0,

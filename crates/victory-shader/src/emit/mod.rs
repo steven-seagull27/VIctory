@@ -1619,17 +1619,20 @@ mod tests {
         emit_pixel(&words, vec![color], 1 << 1, &isg1, &osg1).unwrap();
     }
 
-    /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
-    /// is installed.
     #[cfg(windows)]
-    fn dump_dxil(container: &[u8]) -> Option<String> {
+    fn pc_dxc() -> Option<std::path::PathBuf> {
         let dxc = match std::env::var_os("VICTORY_PC_DXC") {
             Some(p) => std::path::PathBuf::from(p),
             None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
         };
-        if !dxc.exists() {
-            return None;
-        }
+        dxc.is_file().then_some(dxc)
+    }
+
+    /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
+    /// is installed.
+    #[cfg(windows)]
+    fn dump_dxil(container: &[u8]) -> Option<String> {
+        let dxc = pc_dxc()?;
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT_DUMP: AtomicUsize = AtomicUsize::new(0);
         let file = std::env::temp_dir().join(format!(
@@ -1680,6 +1683,164 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mixed_input_matches_centroid_on_msaa_edges() {
+        use super::host::{Draw, Host};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+
+        let Some(dxc) = pc_dxc() else {
+            eprintln!("no PC DXC for the native centroid reference; skipped");
+            return;
+        };
+        // Vary clip W as well as the attribute. A partially covered pixel
+        // can then distinguish center from centroid after the 4x resolve.
+        let source = r#"
+            struct Edge { float4 uv : TEXCOORD0; float4 pos : SV_Position; };
+            Edge edgeVertex(uint i : SV_VertexID) {
+                float2 xy[3] = { float2(-.91,.87), float2(.96,.66), float2(-.70,-.97) };
+                float w[3] = { .75, 1.5, 2 };
+                float attr[3] = { 1, 5, 3 };
+                Edge e; e.pos = float4(xy[i]*w[i], .5*w[i], w[i]); e.uv = attr[i]; return e;
+            }
+            float4 reference(Edge e) : SV_Target {
+                float c = EvaluateAttributeCentroid(e.uv.x);
+                return float4(e.uv.x, c, e.uv.x, c);
+            }
+            float4 center(Edge e) : SV_Target { return e.uv.x; }
+            float4 coverage(Edge e) : SV_Target { return 1; }
+        "#;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "victory-msaa-centroid-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let compile =
+            |entry, profile| super::diff_tests::compile(&dxc, &dir, source, entry, profile);
+        let vs = compile("edgeVertex", "vs_6_0");
+        let reference = compile("reference", "ps_6_0");
+        let center = compile("center", "ps_6_0");
+        let coverage = compile("coverage", "ps_6_0");
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let guest = emit_pixel(
+            &[
+                0xC810_0000,
+                0xC811_0001, // v4 = center attr0.x
+                0xC814_0002,
+                0xC815_0003, // v5 = centroid attr0.x
+                0xF800_180F,
+                0x0504_0504, // exp mrt0, v4, v5, v4, v5
+                0xBF81_0000,
+            ],
+            vec![texcoord(false)],
+            1 << 1 | 1 << 2,
+            &rows(&[("TEXCOORD", 0, false)], true),
+            &rows(&[("SV_Target", 16, false)], false),
+        )
+        .unwrap();
+        let draw = Draw {
+            roots: vec![],
+            textures: &[],
+            samplers: &[],
+            vertices: &[],
+            stride: 0,
+            size: (32, 32),
+            mesh_groups: 0,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        for (label, warp) in [("hardware", false), ("WARP", true)] {
+            if force_warp && !warp {
+                continue;
+            }
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let mut caps = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS {
+                Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                SampleCount: 4,
+                ..Default::default()
+            };
+            let mut format = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: caps.Format,
+                ..Default::default()
+            };
+            // SAFETY: both queries write to initialized, correctly sized structures.
+            unsafe {
+                host.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                        (&raw mut caps).cast(),
+                        size_of_val(&caps) as u32,
+                    )
+                    .unwrap();
+                host.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_FORMAT_SUPPORT,
+                        (&raw mut format).cast(),
+                        size_of_val(&format) as u32,
+                    )
+                    .unwrap();
+            }
+            if caps.NumQualityLevels == 0
+                || !format
+                    .Support1
+                    .contains(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE)
+            {
+                eprintln!("{label} cannot resolve a 4x RGBA32F target; skipped");
+                continue;
+            }
+            let root = host.root_signature_for(&[]).unwrap();
+            let render = |ps: &[u8]| {
+                let pso = host.pipeline_samples(&root, &vs, &[], ps, 4).unwrap();
+                host.draw_samples(&root, &pso, &draw, 4).unwrap()
+            };
+            let expected = render(&reference);
+            let actual = render(&guest.dxil);
+            let center = render(&center);
+            let coverage = render(&coverage);
+            let mut sensitive = 0;
+            for (i, ((a, e), (c, mask))) in actual
+                .iter()
+                .zip(&expected)
+                .zip(center.iter().zip(&coverage))
+                .enumerate()
+            {
+                assert_eq!(
+                    a.map(f32::to_bits),
+                    e.map(f32::to_bits),
+                    "{label} pixel ({}, {})",
+                    i % 32,
+                    i / 32
+                );
+                if e != c {
+                    assert!(
+                        mask[0] > 0.0 && mask[0] < 1.0,
+                        "{label}: centroid differed away from an edge"
+                    );
+                    sensitive += 1;
+                }
+            }
+            assert!(
+                sensitive > 0,
+                "{label}: the draw never distinguished centroid from center"
+            );
+            eprintln!(
+                "{label}: {} pixels matched; {sensitive} edges distinguish centroid",
+                actual.len()
+            );
         }
     }
 
