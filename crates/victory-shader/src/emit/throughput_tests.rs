@@ -76,13 +76,32 @@ fn join_shader(id: usize) -> Vec<u8> {
     container::build(&[(b"DXIL", &compute_with_indexed_uav(&code))])
 }
 
+/// Reload the table descriptor 16 to 520 times and use both buffer reads
+/// from every descriptor in the result. Resource tracking visits each load.
+fn table_load_shader(id: usize) -> Vec<u8> {
+    let mut w = vec![0xBE84_0300u32, 0xBE85_0380, 0x7E08_0280]; // table base; v4 = 0
+    for _ in 0..16 + 8 * id {
+        w.extend([
+            0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xBF8C_C07F, // wait for the descriptor
+            0xE030_2000, 0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen
+            0xE030_2000, 0x8002_0300, // buffer_load_dword v3, v0, s[8:11], 0 idxen
+            0xBF8C_3F70, // wait for the two reads
+            0x4A08_0902, 0x4A08_0903, // add v2 and v3 to v4
+        ]);
+    }
+    w.extend([0xE070_2000, 0x8002_0400, 0xBF81_0000]); // store v4 at tid
+    let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+    container::build(&[(b"DXIL", &compute_with_indexed_uav(&code))])
+}
+
 #[test]
 #[ignore = "CPU throughput diagnostic; run with --release --ignored --nocapture"]
 fn translate_public_compute_batch() {
-    let generate = if std::env::var("VICTORY_BENCH_CORPUS").as_deref() == Ok("joins") {
-        join_shader
-    } else {
-        shader
+    let generate = match std::env::var("VICTORY_BENCH_CORPUS").as_deref() {
+        Ok("table-loads") => table_load_shader,
+        Ok("joins") => join_shader,
+        _ => shader,
     };
     let corpus: Vec<_> = (0..64).map(generate).collect();
     let workers: usize = std::env::var("VICTORY_BENCH_WORKERS")
