@@ -930,6 +930,34 @@ pub(crate) mod tests {
         );
     }
 
+    /// Compressed Wave32 CS with the UAV table used by the translation benchmark.
+    pub(crate) fn compute_with_indexed_uav(code: &[u8]) -> Vec<u8> {
+        let stage = HwStage::Cs;
+        let mut blob = fssm(&[(stage, code)]);
+        let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(stage)).unwrap() as usize;
+        let data = stage_data_at(&blob, stage);
+        blob[record + RECORD_FLAGS..][..4].copy_from_slice(&FLAG_WAVE32.to_le_bytes());
+        blob[data + CS_RSRC2..][..4].copy_from_slice(&((2u32 << 1) | (1 << 7)).to_le_bytes());
+        for (i, n) in [32u32, 1, 1].into_iter().enumerate() {
+            blob[data + CS_THREADS + 4 * i..][..4].copy_from_slice(&n.to_le_bytes());
+        }
+        let tables = (blob.len() - FSSM_HEADER) as u64;
+        for v in [3u32, 0, 1, 0] {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        blob.extend_from_slice(&[0, 0, 0, 0, 3, 3, 0, 0]);
+        for v in [0u32, 0, 4] {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        blob.extend_from_slice(&[4, 0, 0, 0]);
+        let payload = (blob.len() - FSSM_HEADER) as u64;
+        blob[8..16].copy_from_slice(&payload.to_le_bytes());
+        blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&tables.to_le_bytes());
+        blob[record + RECORD_USED..][..8].copy_from_slice(&(tables + ENTRY_SIZE).to_le_bytes());
+        blob[record + RECORD_COUNTS..][..8].copy_from_slice(&[1, 0, 0, 0, 1, 0, 0, 0]);
+        part(&[(KIND_NATIVE, &xbch(&blob))])
+    }
+
     #[test]
     fn reads_root_tables() {
         let mut blob = fssm(&[(HwStage::Ps, &PS_CODE)]);

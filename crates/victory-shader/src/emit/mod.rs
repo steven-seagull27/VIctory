@@ -197,6 +197,8 @@
 
 mod bitcode;
 #[cfg(test)]
+mod throughput_tests;
+#[cfg(test)]
 mod census_tests;
 #[cfg(all(test, windows))]
 mod bvh_tests;
