@@ -1049,7 +1049,7 @@ impl State {
             return;
         };
         let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
-        let (Some(heap), Some(host)) = (heap, crate::host::host()) else {
+        let Some(heap) = heap else {
             once!("an unordered access clear without a bound view heap");
             return;
         };
@@ -1059,9 +1059,7 @@ impl State {
         };
         self.dynamic
             .push((std::ptr::from_ref(heap) as usize, slot, 1));
-        visible.make_at(slot, &view);
-        let at = host.cpu_view();
-        let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
+        let Some((at, resource)) = visible.make_clear_at(slot, &view) else {
             once!("an unordered access clear of a view the host cannot make");
             return;
         };
@@ -2028,6 +2026,8 @@ const QUAD_STRIP: u32 = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod structured_clear;
 
     /// A root signature that indexes the heaps directly needs one of each
     /// kind bound before it is set: our sampler heap stands in for a title
