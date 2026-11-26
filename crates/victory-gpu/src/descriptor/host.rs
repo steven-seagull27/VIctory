@@ -13,6 +13,10 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at, views_current};
 use crate::host::host;
 
+#[cfg(test)]
+#[path = "overlap_test.rs"]
+mod overlap_test;
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
