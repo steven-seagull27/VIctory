@@ -2226,15 +2226,20 @@ mod tests {
             for i in 0..threads {
                 let token = 0xA5A5_0000 | i as u32;
                 s.spawn(move || {
-                    let host = Host::new_for(false).expect("hardware Host::new");
-                    let (root, pso) = host.compute_pipeline(shader).expect("hardware pipeline");
+                    let setup = Host::new_for(false).map(|host| {
+                        let pipeline = host.compute_pipeline(shader);
+                        (host, pipeline)
+                    });
+                    // A worker with a setup error must still release its peers.
+                    barrier.wait();
+                    let (host, pipeline) = setup.expect("hardware Host::new");
+                    let (root, pso) = pipeline.expect("hardware pipeline");
                     let mut user_data = vec![0; shader.user_data_dwords().max(1) as usize];
                     for u in &shader.user_data {
                         if u.root == crate::native::RootType::Constants {
                             user_data[u.index as usize] = token;
                         }
                     }
-                    barrier.wait();
                     let out = host
                         .dispatch(
                             &root,
