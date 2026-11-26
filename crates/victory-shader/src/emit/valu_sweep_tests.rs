@@ -4,69 +4,18 @@
 //! and prints every mismatch before failing; they are `#[ignore]`d because
 //! they take a while (`cargo test -p victory-shader --lib sweep -- --ignored
 //! --nocapture`). `SWEEP_NORM_ONLY=1` limits the format sweep to the UNORM and
-//! SNORM formats (about 2 minutes instead of 8); `SWEEP_D16=1` adds the d16
-//! loads, which need `tbuffer_load_format_d16_*` (#169).
+//! SNORM formats. `SWEEP_D16=1` adds the d16 loads.
 
-use super::super::host::{Dispatch, Host, Root, View};
 use super::super::HostShader;
-use crate::native::RootType;
+use super::super::host::{Dispatch, Host, Root, Stride, View};
 use super::{
-    ONE_AT_A_TIME, build_valu_cs, buffer_store_dword, f16_to_f32, is_f16_nan, vgpr, vop1,
+    ONE_AT_A_TIME, build_valu_cs, f16_to_f32, is_f16_nan, lower_valu_cs, run_cases, vgpr, vop1,
     vop3,
 };
+use crate::native::{
+    ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+};
 use std::collections::BTreeMap;
-
-/// MTBUF `op vdata, off, s[srsrc:srsrc+3], 0 format:format` (at byte 0).
-const fn mtbuf(op: u8, vdata: u8, srsrc: u8, format: u8) -> [u32; 2] {
-    [
-        0x3A << 26 | (format as u32 & 0x7F) << 19 | (op as u32 & 7) << 16,
-        0x80 << 24
-            | (op as u32 >> 3 & 1) << 21
-            | (srsrc as u32 >> 2 & 0x1F) << 16
-            | (vdata as u32) << 8,
-    ]
-}
-
-/// Runs `shader` with a 4-dword raw UAV (the inputs stored there are what
-/// the typed loads read) on the hardware GPU and WARP, and returns
-/// `(backend, case, result dword)` for every case.
-fn run_wide(shader: &HostShader, cases: &[[u32; 4]]) -> Vec<(&'static str, usize, u32)> {
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut out = Vec::new();
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
-        let (root, pso) = host
-            .compute_pipeline(shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        for (i, &inputs) in cases.iter().enumerate() {
-            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-            for u in &shader.user_data {
-                ud[u.index as usize] = match (u.root, u.slot) {
-                    (RootType::Constants, 0) => inputs[u.dword as usize],
-                    (RootType::Table, 1) => 0,
-                    other => panic!("unexpected user data {other:?}"),
-                };
-            }
-            let res = host
-                .dispatch(
-                    &root,
-                    &pso,
-                    &Dispatch {
-                        roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(4)],
-                        samplers: &[],
-                        groups: [1, 1, 1],
-                    },
-                )
-                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            out.push((label, i, res[0][0]));
-        }
-    }
-    out
-}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Num {
@@ -243,18 +192,94 @@ fn input_cases() -> Vec<[u32; 4]> {
     cases
 }
 
-/// Stores v1..v4 at bytes 0..16, loads them back with tbuffer `op` in
-/// `format` into v0.., and moves VGPR `pick` of the result to v0.
-fn format_shader(op: u8, format: u8, pick: u8) -> HostShader {
-    let mut body = Vec::new();
-    for k in 0..4u8 {
-        body.extend(buffer_store_dword(k + 1, 8, u16::from(k) * 4));
+/// Each one-thread group loads its own 16-byte row from the input SRV and
+/// writes all xyzw channels to the matching row in a separate raw UAV.
+fn format_shader(format: u8, d16: bool) -> HostShader {
+    let words = [
+        vop1(0x001, 0, 1), // v_mov_b32 v0, s1 (group ID x)
+        0x3400_0084,       // v_lshlrev_b32 v0, 4, v0 (byte offset)
+        0xBE81_0380,       // s_mov_b32 s1, 0 (high half of table address)
+        0xF408_0200,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], 0
+        0xF408_0300,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[0:1], 32
+        0xE803_1000 | (u32::from(format) << 19),
+        0x8002_0100 | (u32::from(d16) << 21), // tbuffer_load_format[_d16]_xyzw into v1..
+        if d16 { 0xE074_1000 } else { 0xE078_1000 },
+        0x8003_0100, // buffer_store_dwordx2 / x4 v1.., v0, s[12:15], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let range = |kind, table_offset_dwords| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    };
+    lower_valu_cs(&NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 5,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![range(ResourceType::Srv, 0), range(ResourceType::Uav, 8)],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 7 | 1 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    })
+    .expect("lower typed buffer sweep")
+}
+
+fn format_rows(shader: &HostShader, cases: &[[u32; 4]]) -> Vec<(&'static str, Vec<u32>)> {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rows = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .expect("typed buffer sweep pipeline");
+        let count = cases.len() as u32;
+        let mut readback = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(
+                        0,
+                        Root::Constants(vec![0; shader.user_data_dwords() as usize]),
+                    )],
+                    views: &[
+                        View::Buffer {
+                            data: cases.as_flattened(),
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(4 * count),
+                    ],
+                    samplers: &[],
+                    groups: [count, 1, 1],
+                },
+            )
+            .expect("typed buffer sweep dispatch");
+        let data = readback.remove(0);
+        assert_eq!(data.len(), 4 * cases.len(), "{label} readback length");
+        rows.push((label, data));
     }
-    body.extend(mtbuf(op, 0, 8, format));
-    if pick != 0 {
-        body.push(vop1(0x001, 0, vgpr(pick)));
-    }
-    build_valu_cs(&body)
+    assert!(
+        !rows.is_empty(),
+        "neither hardware nor WARP SM 6.6 device available"
+    );
+    rows
 }
 
 /// Mismatches grouped by what failed: key -> (count, first example).
@@ -284,34 +309,35 @@ fn sweep_typed_buffer_formats() {
             continue;
         }
         let refs: Vec<Vec<Exact>> = cases.iter().map(|&c| channels(bits, num, c)).collect();
-        // tbuffer_load_format_xyzw (op 3): one channel per VGPR.
-        for ch in 0..4u8 {
-            let shader = format_shader(3, n, ch);
-            for (backend, i, got) in run_wide(&shader, &cases) {
-                checked += 1;
-                let wants = want32(&refs[i][ch as usize]);
-                let ok = wants.iter().any(|w| match *w {
-                    Want::Bits(b) => b == got,
-                    Want::NanF32 => f32::from_bits(got).is_nan(),
-                });
-                if !ok {
-                    note(
-                        &mut findings,
-                        format!("{backend} fmt {n} {name} xyzw ch{ch}"),
-                        format!("in {:08x?} got {got:#010x} want {wants:x?}", cases[i]),
-                    );
+        let shader = format_shader(n, false);
+        for (backend, values) in format_rows(&shader, &cases) {
+            for (i, row) in values.chunks_exact(4).enumerate() {
+                for (ch, &got) in row.iter().enumerate() {
+                    checked += 1;
+                    let wants = want32(&refs[i][ch]);
+                    let ok = wants.iter().any(|w| match *w {
+                        Want::Bits(b) => b == got,
+                        Want::NanF32 => f32::from_bits(got).is_nan(),
+                    });
+                    if !ok {
+                        note(
+                            &mut findings,
+                            format!("{backend} fmt {n} {name} xyzw ch{ch}"),
+                            format!("in {:08x?} got {got:#010x} want {wants:x?}", cases[i]),
+                        );
+                    }
                 }
             }
         }
-        // tbuffer_load_format_d16_xyzw (op 11): two channels per VGPR.
-        let d16 = if std::env::var_os("SWEEP_D16").is_some() { 2u8 } else { 0 };
-        for dw in 0..d16 {
-            let shader = format_shader(11, n, dw);
-            for (backend, i, got) in run_wide(&shader, &cases) {
-                checked += 1;
-                for half in 0..2usize {
-                    let ch = 2 * dw as usize + half;
-                    let g = (got >> (16 * half)) as u16;
+        if std::env::var_os("SWEEP_D16").is_none() {
+            continue;
+        }
+        let shader = format_shader(n, true);
+        for (backend, values) in format_rows(&shader, &cases) {
+            for (i, row) in values.chunks_exact(4).enumerate() {
+                checked += 2; // two packed dwords per row
+                for ch in 0..4 {
+                    let g = (row[ch / 2] >> (16 * (ch % 2))) as u16;
                     let wants = want16(&refs[i][ch]);
                     let ok = wants.iter().any(|w| match *w {
                         Some(b) => b == g,
@@ -329,7 +355,11 @@ fn sweep_typed_buffer_formats() {
         }
     }
     print("typed buffer formats", &findings, checked);
-    assert!(findings.is_empty(), "{} mismatch groups (printed above)", findings.len());
+    assert!(
+        findings.is_empty(),
+        "{} mismatch groups (printed above)",
+        findings.len()
+    );
 }
 
 /// f16 inputs: specials, then pseudo-random halves of every exponent
@@ -411,7 +441,7 @@ fn sweep_f16_alu() {
             })
             .collect();
         let shader = build_valu_cs(&words);
-        for (backend, i, got) in run_wide(&shader, &cases) {
+        run_cases(&shader, &cases, |backend, i, _, got| {
             checked += 1;
             let lanes = if packed { 2 } else { 1 };
             for lane in 0..lanes {
@@ -436,7 +466,7 @@ fn sweep_f16_alu() {
                     );
                 }
             }
-        }
+        });
     }
     // v_cvt_f16_f32 and v_cvt_f32_f16 over pseudo-random bits.
     let mut s = 0xDEAD_BEEF_u64;
@@ -452,7 +482,7 @@ fn sweep_f16_alu() {
     }
     let cvt = build_valu_cs(&[vop1(0x001, 0, 0x80), vop1(0x00A, 0, vgpr(1))]);
     let cases: Vec<[u32; 4]> = f32s.iter().map(|&b| [b, 0, 0, 0]).collect();
-    for (backend, i, got) in run_wide(&cvt, &cases) {
+    run_cases(&cvt, &cases, |backend, i, _, got| {
         checked += 1;
         let x = f64::from(f32::from_bits(cases[i][0]));
         let want = rne_or_nan(x);
@@ -468,11 +498,11 @@ fn sweep_f16_alu() {
                 format!("({:#010x}) = {g:#06x}, want {want:x?}", cases[i][0]),
             );
         }
-    }
+    });
     let widen = build_valu_cs(&[vop1(0x00B, 0, vgpr(1))]);
     let halves: Vec<u16> = (0..=0xFFFFu32).step_by(97).map(|h| h as u16).collect();
     let cases: Vec<[u32; 4]> = halves.iter().map(|&h| [u32::from(h), 0, 0, 0]).collect();
-    for (backend, i, got) in run_wide(&widen, &cases) {
+    run_cases(&widen, &cases, |backend, i, _, got| {
         checked += 1;
         let want = f16_to_f32(halves[i]);
         let ok = if want.is_nan() { f32::from_bits(got).is_nan() } else { got == want.to_bits() };
@@ -483,7 +513,7 @@ fn sweep_f16_alu() {
                 format!("({:#06x}) = {got:#010x}, want {:#010x}", halves[i], want.to_bits()),
             );
         }
-    }
+    });
     print("f16 ALU", &findings, checked);
     assert!(findings.is_empty(), "{} mismatch groups (printed above)", findings.len());
 }
