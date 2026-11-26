@@ -8185,6 +8185,16 @@ impl<'a> Lower<'a> {
                                 .get(&ph.value)
                                 .and_then(|v| v.get(n).copied())
                                 .or_else(|| st.masks.get(&ph.args[n]).copied())?;
+                            // A mixed join may emit false on a data edge. If the
+                            // structural expression disagrees, it cannot prove that
+                            // those lanes did not overwrite a barycentric.
+                            if incoming != Bool::FALSE
+                                && !st.masks.contains_key(&ph.args[n])
+                                && !self.uniform_join(to)
+                                && self.no_mask_lane_on_edge(to, &ph.args, n)
+                            {
+                                return None;
+                            }
                             Some((joined, incoming))
                         })
                         .collect();
@@ -8229,21 +8239,15 @@ impl<'a> Lower<'a> {
 
     /// Whether every lane enters IR block `b` along the edge the console's
     /// wave takes, so that an SGPR joined there holds what that edge
-    /// brought: every branch into it is uniform (SCC values). The wave runs
-    /// one path; a per-lane branch into the join (an EXEC skip, a loop's
-    /// per-lane exit) is where lanes would take edges the wave did not, and
-    /// the console compiler's if/else always skips into its join that way.
-    /// Lanes that left EXEC inside a uniform loop (the BVH walks) take no
-    /// edge into its header; the others take the wave's.
+    /// brought. Both the choice of predecessor and its outgoing edge must
+    /// be uniform. An unconditional jump may end an arm entered by only
+    /// part of the wave.
     fn uniform_join(&self, b: usize) -> bool {
-        let st = self.x.st;
-        let preds = &self.x.p.blocks[b].preds;
-        preds.iter().filter(|&&q| self.block[q].is_some()).all(|&q| match st.exits[q] {
-            LaneExit::Branch { when, taken, not_taken } if taken != not_taken => {
-                st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
-            }
-            _ => true,
-        })
+        self.x.p.blocks[b]
+            .preds
+            .iter()
+            .filter(|&&q| self.block[q].is_some())
+            .all(|&q| phi::uniform_predecessor(self.x.st, q))
     }
 
     /// Whether no lane goes from IR block `q` to `b`.

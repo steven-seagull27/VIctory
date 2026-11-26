@@ -2283,6 +2283,10 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
 }
 
 fn build_wave32_cs(body: &[u32]) -> HostShader {
+    try_build_wave32_cs(body).expect("lower")
+}
+
+fn try_build_wave32_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -2352,8 +2356,7 @@ fn build_wave32_cs(body: &[u32]) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
-    })
-    .expect("lower");
+    })?;
 
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -2379,7 +2382,7 @@ fn build_wave32_cs(body: &[u32]) -> HostShader {
         assert_eq!(copy[4..20], ours[..], "container hash mismatch");
     }
 
-    shader
+    Ok(shader)
 }
 
 fn dispatch_wave32(
@@ -2436,6 +2439,48 @@ fn dispatch_wave32(
         ran > 0,
         "{name}: neither hardware nor WARP SM 6.6 device available"
     );
+}
+
+#[test]
+fn two_jump_predecessors_follow_the_wave_wide_scalar_write() {
+    let mut words = [
+        0x7D88_0000,        // v_cmp_gt_u32 vcc_lo, s0, v0 (lane < s0)
+        s_mov_b32(2, 0x80), // s2 = 0
+        0xBE87_3C6A,        // s_and_saveexec_b32 s7, vcc_lo
+        0xBF88_0002,        // s_cbranch_execz -> skip arm
+        s_mov_b32(2, 7),    // any active lane: s2 = original EXEC (all bits)
+        0xBF82_0001,        // s_branch -> join
+        0xBF82_0000,        // skip arm: s_branch -> join
+        s_mov_b32(0x7e, 7), // join: restore EXEC before reading s2
+        0xD501_0001,
+        0x80 | (0x81 << 9) | (2 << 18), // v_cndmask_b32 v1, 0, 1, s2
+    ];
+    let cases: Vec<_> = [0, 1, 8, 16, 31, 32]
+        .map(|n| ([n, 0, 0, 0], vec![u32::from(n != 0); 32]))
+        .into();
+    // Both initial values are zero when the entire wave skips its scalar write.
+    // Using VCC also exercises two tracked incoming masks.
+    for initial in [0x80, 0x6a] {
+        words[1] = s_mov_b32(2, initial);
+        match try_build_wave32_cs(&words) {
+            Ok(shader) => dispatch_wave32("divergent_join", &shader, false, &cases),
+            Err(crate::ShaderError::Unsupported {
+                what:
+                    "a scalar lane mask joined after a per-lane split"
+                    | "a lane-mask join of an untracked mask",
+                ..
+            }) => {}
+            Err(other) => panic!("unexpected translation failure: {other}"),
+        }
+    }
+
+    // Keep the two jumps but choose the arm by a uniform scalar compare.
+    // Every lane follows the same arm, so this version must translate.
+    words[0] = 0xBF07_8000; // s_cmp_lg_u32 s0, 0
+    words[1] = s_mov_b32(2, 0x80);
+    words[2] = s_mov_b32(7, 0x7e); // save the original EXEC
+    words[3] = 0xBF84_0002; // s_cbranch_scc0 -> skip arm
+    dispatch_wave32("uniform_join", &build_wave32_cs(&words), false, &cases);
 }
 
 #[test]
@@ -2557,16 +2602,17 @@ fn lane_mask_phi_whole_read_and_readlane_execute_correctly() {
     // 1. Per-lane join where given(m, e) == Bool::TRUE inside the taken arm
     // (`s2 = vcc_lo` under `v0 < s0`), then read as a whole mask and via `v_readlane_b32`.
     let mut vcc_words = vec![
-        0x7D88_0000,            // v_cmp_gt_u32 vcc_lo, s0, v0 (v0 < s0)
-        s_mov_b32(2, 0x80),     // s2 = 0
-        0xBE87_3C6A,            // s_and_saveexec_b32 s7, vcc_lo
-        0xBF88_0001,            // s_cbranch_execz +1
-        s_mov_b32(2, 0x6A),     // s2 = vcc_lo
-        s_mov_b32(0x7E, 7),     // exec_lo = s7
+        0x7D88_0000,        // v_cmp_gt_u32 vcc_lo, s0, v0 (v0 < s0)
+        s_mov_b32(2, 0x80), // s2 = 0
+        0xBE87_3C6A,        // s_and_saveexec_b32 s7, vcc_lo
+        0xBF88_0001,        // s_cbranch_execz +1
+        s_mov_b32(2, 0x6A), // s2 = vcc_lo
+        s_mov_b32(0x7E, 7), // exec_lo = s7
     ];
     pack_whole_and_lanes(&mut vcc_words);
     let vcc_shader = build_wave32_cs(&vcc_words);
-    let mask_of = |n: u32| u32::try_from(1u64.checked_shl(n).map_or(0u64, |v| v - 1)).unwrap_or(u32::MAX);
+    let mask_of =
+        |n: u32| u32::try_from(1u64.checked_shl(n).map_or(0u64, |v| v - 1)).unwrap_or(u32::MAX);
     let vcc_cases: Vec<([u32; 4], Vec<u32>)> = [0, 1, 7, 16, 31, 32]
         .into_iter()
         .map(|n| {
@@ -2574,27 +2620,38 @@ fn lane_mask_phi_whole_read_and_readlane_execute_correctly() {
             ([n, 0, 0, 0], expected(m))
         })
         .collect();
-    dispatch_wave32("per_lane_vcc_whole_mask_and_readlane", &vcc_shader, true, &vcc_cases);
+    dispatch_wave32(
+        "per_lane_vcc_whole_mask_and_readlane",
+        &vcc_shader,
+        true,
+        &vcc_cases,
+    );
 
     // 2. Per-lane join assigning a distinct sub-mask (`v0 < s1`) under `v0 < s0`.
     let mut sub_words = vec![
-        0x7D88_0000,                            // v_cmp_gt_u32 vcc_lo, s0, v0 (v0 < s0)
-        s_mov_b32(2, 0x80),                     // s2 = 0
-        0xBE87_3C6A,                            // s_and_saveexec_b32 s7, vcc_lo
-        0xBF88_0002,                            // s_cbranch_execz +2
-        0xD4C4_0002,                            // v_cmp_gt_u32 s2, s1, v0 (v0 < s1)
+        0x7D88_0000,        // v_cmp_gt_u32 vcc_lo, s0, v0 (v0 < s0)
+        s_mov_b32(2, 0x80), // s2 = 0
+        0xBE87_3C6A,        // s_and_saveexec_b32 s7, vcc_lo
+        0xBF88_0002,        // s_cbranch_execz +2
+        0xD4C4_0002,        // v_cmp_gt_u32 s2, s1, v0 (v0 < s1)
         u32::from(sgpr(1)) | (u32::from(vgpr(0)) << 9),
-        s_mov_b32(0x7E, 7),                     // exec_lo = s7
+        s_mov_b32(0x7E, 7), // exec_lo = s7
     ];
     pack_whole_and_lanes(&mut sub_words);
     let sub_shader = build_wave32_cs(&sub_words);
-    let sub_cases: Vec<([u32; 4], Vec<u32>)> = [(0, 16), (16, 0), (16, 8), (8, 24), (32, 1), (32, 32)]
-        .into_iter()
-        .map(|(a, b)| {
-            let k = a.min(b);
-            let m = if k >= 32 { u32::MAX } else { mask_of(k) };
-            ([a, b, 0, 0], expected(m))
-        })
-        .collect();
-    dispatch_wave32("per_lane_submask_whole_mask_and_readlane", &sub_shader, true, &sub_cases);
+    let sub_cases: Vec<([u32; 4], Vec<u32>)> =
+        [(0, 16), (16, 0), (16, 8), (8, 24), (32, 1), (32, 32)]
+            .into_iter()
+            .map(|(a, b)| {
+                let k = a.min(b);
+                let m = if k >= 32 { u32::MAX } else { mask_of(k) };
+                ([a, b, 0, 0], expected(m))
+            })
+            .collect();
+    dispatch_wave32(
+        "per_lane_submask_whole_mask_and_readlane",
+        &sub_shader,
+        true,
+        &sub_cases,
+    );
 }

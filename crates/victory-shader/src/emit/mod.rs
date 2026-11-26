@@ -1520,6 +1520,38 @@ mod tests {
         assert!(e.to_string().contains("a conditional export"), "{e}");
     }
 
+    #[test]
+    fn computed_barycentric_must_follow_emitted_mask_phi() {
+        let isg1 = rows(&[("TEXCOORD", 0, false), ("SV_Position", 3, false)], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        for negative in [false, true] {
+            let words = [
+                0xBE86_03C1, // s6 = -1 (non-mask data on the skip edge)
+                0x7C02_0480, // v_cmp_lt_f32 vcc_lo, 0, v2
+                0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+                0xBF88_0003, // s_cbranch_execz -> skip arm
+                0xD4C4_0006,
+                0x0002_0488, // v_cmp_gt_u32 s6, 8, v2 (under narrowed EXEC)
+                0xBF82_0002, // jump to join
+                0xBEFE_0308, // skip arm: restore EXEC
+                0x7E02_0280, // v1 = 0 (overwrites the j coordinate)
+                if negative { 0x8A7E_0608 } else { 0x877E_0608 }, // exec = saved & (!s6 or s6)
+                0xC80C_0000, // v_interp_p1_f32 v3, v0, attr0.x
+                0xC80D_0001, // v_interp_p2_f32 v3, v1, attr0.x
+                0xBEFE_0308, // restore EXEC
+                0xF800_180F,
+                0x0303_0303,
+                0xBF81_0000,
+            ];
+            let result = emit_pixel(&words, vec![texcoord(false)], 1 << 1 | 1 << 8, &isg1, &osg1);
+            let error = result.expect_err("an unproven interpolation was accepted");
+            assert!(
+                error.to_string().contains("computed barycentrics"),
+                "{error}"
+            );
+        }
+    }
+
     /// The compiler reuses the j register (`v_mov` under a kill's EXEC) and
     /// interpolates in the other lanes: those still hold j, which
     /// structurisation's lane conditions prove. Interpolating in the lanes

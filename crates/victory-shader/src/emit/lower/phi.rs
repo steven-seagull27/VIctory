@@ -10,6 +10,26 @@ use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{Program, Reg, Value};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+/// A jump can end an arm reached by only part of the wave. Check both the
+/// reach of the predecessor and the decision made at its outgoing edge.
+pub(super) fn uniform_predecessor(st: &Structured, q: usize) -> bool {
+    let uniform = |cond| {
+        st.bools
+            .support(cond)
+            .iter()
+            .all(|a| matches!(a, Atom::Uniform(_)))
+    };
+    uniform(st.reach[q])
+        && match st.exits[q] {
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } if taken != not_taken => uniform(when),
+            _ => true,
+        }
+}
+
 /// Whether any branch condition, instruction guard, or vector select/carry-in
 /// mask reaches an opaque or constant lane set (including transitively across
 /// `phi_masks`), requiring the console wave size and lane order.
@@ -34,10 +54,7 @@ pub(super) fn mask_uses_console_lanes(
             };
             if !matches!(
                 i.name(),
-                "v_cndmask_b32"
-                    | "v_add_co_ci_u32"
-                    | "v_sub_co_ci_u32"
-                    | "v_subrev_co_ci_u32"
+                "v_cndmask_b32" | "v_add_co_ci_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32"
             ) {
                 return None;
             }
@@ -81,18 +98,7 @@ pub(super) fn mask_uses_console_lanes(
                             .preds
                             .iter()
                             .filter(|&&q| st.reach[q] != Bool::FALSE)
-                            .all(|&q| match st.exits[q] {
-                                LaneExit::Branch {
-                                    when,
-                                    taken,
-                                    not_taken,
-                                } if taken != not_taken => st
-                                    .bools
-                                    .support(when)
-                                    .iter()
-                                    .all(|a| matches!(a, Atom::Uniform(_))),
-                                _ => true,
-                            });
+                            .all(|&q| uniform_predecessor(st, q));
                         for (n, &e) in edges.iter().enumerate() {
                             if st.reach[p.blocks[b].preds[n]] == Bool::FALSE {
                                 continue;
@@ -118,25 +124,31 @@ impl Lower<'_> {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
             let uniform = self.uniform_join(b);
+            // A pair of jumps can reconverge lanes split at an earlier branch.
+            // Even two tracked masks can then give lanes an SGPR from the arm
+            // that the console wave skipped.
+            let mut live = p.blocks[b]
+                .preds
+                .iter()
+                .zip(&phi.args)
+                .filter(|&(&q, _)| self.block[q].is_some());
+            let mut masks = live.clone().filter_map(|(_, arg)| self.x.st.masks.get(arg));
+            if !uniform
+                && live.all(|(&q, _)| matches!(self.x.st.exits[q], LaneExit::Jump(_)))
+                && let Some(first) = masks.next()
+                && masks.any(|m| m != first)
+            {
+                return Err(unsupported(
+                    offset,
+                    "a scalar lane mask joined after a per-lane split",
+                ));
+            }
             let forward_uniform = uniform
                 || p.blocks[b]
                     .preds
                     .iter()
                     .filter(|&&q| self.block[q].is_some() && self.rpo[q] < self.rpo[b])
-                    .all(|&q| match self.x.st.exits[q] {
-                        LaneExit::Branch {
-                            when,
-                            taken,
-                            not_taken,
-                        } if taken != not_taken => self
-                            .x
-                            .st
-                            .bools
-                            .support(when)
-                            .iter()
-                            .all(|a| matches!(a, Atom::Uniform(_))),
-                        _ => true,
-                    });
+                    .all(|&q| uniform_predecessor(self.x.st, q));
             let number = self.console_lanes && !self.x.native.wave64 && uniform;
             let phi_edges = self.x.st.phi_masks.get(&phi.value);
             let mut incoming = Vec::new();
@@ -412,7 +424,10 @@ mod tests {
             S_ENDPGM,
         ];
         let lowered = lowers_cs(&words, true, 1).unwrap();
-        assert!(lowered.wave_ops, "expected WAVE_OPS for Wave64 console_lanes");
+        assert!(
+            lowered.wave_ops,
+            "expected WAVE_OPS for Wave64 console_lanes"
+        );
         validate_dxil(&lowered.dxil);
     }
 
