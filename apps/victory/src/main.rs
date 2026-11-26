@@ -1,9 +1,10 @@
 //! `victory`: the command-line front end.
 //!
-//! Every command reads the user's own files and writes only to stdout or to
-//! the user's cache directory (outside the repository).
+//! Commands read the user's own files. Caches and private diagnostic output
+//! live outside the repository.
 
 mod census;
+mod fingerprints;
 mod inspect;
 mod prebuild;
 mod run;
@@ -79,6 +80,9 @@ enum Command {
     /// translator and report what it cannot handle yet.
     Translate {
         paths: Vec<PathBuf>,
+        /// Save private input, emitted DXIL and binding fingerprints for an offline comparison.
+        #[arg(long, conflicts_with_all = ["cache", "validate", "pipelines", "list"])]
+        fingerprints: Option<PathBuf>,
         /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
         /// else the newest Windows SDK's).
         #[arg(long)]
@@ -101,6 +105,8 @@ enum Command {
         #[arg(long, conflicts_with_all = ["validate", "list"])]
         cache: bool,
     },
+    /// Compare two translation fingerprint files and print aggregate counts.
+    CompareShaderFingerprints { before: PathBuf, after: PathBuf },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -181,6 +187,7 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
+            fingerprints,
             cache: false,
         } => translate::run(
             paths,
@@ -188,7 +195,11 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs.map(NonZeroUsize::get),
+            fingerprints.as_deref(),
         ),
+        Command::CompareShaderFingerprints { before, after } => {
+            fingerprints::compare(&before, &after)
+        }
         Command::Run {
             exe,
             unimplemented,

@@ -158,9 +158,15 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    manifest: Option<&Path>,
 ) -> Result<()> {
+    if let Some(path) = manifest {
+        victory_core::ensure_outside_repo(path)?;
+    }
     // Dumped shaders and validator reports are game-derived (rule #1).
-    if let Some(dir) = std::env::var_os("VICTORY_EMIT_DUMP") {
+    if manifest.is_none()
+        && let Some(dir) = std::env::var_os("VICTORY_EMIT_DUMP")
+    {
         victory_core::ensure_outside_repo(Path::new(&dir))?;
     }
     let paths = crate::default_paths(paths)?;
@@ -187,17 +193,27 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
+    let fingerprints = Mutex::new(crate::fingerprints::Batch::default());
+    let mut skipped_large_files = 0usize;
     let started = std::time::Instant::now();
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+        for entry in walkdir::WalkDir::new(root) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) if manifest.is_some() => return Err(e.into()),
+                Err(_) => continue,
+            };
+            if !entry.file_type().is_file() {
                 continue;
             }
-            let Ok(data) = std::fs::read(entry.path()) else {
+            if entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                skipped_large_files += 1;
                 continue;
+            }
+            let data = match std::fs::read(entry.path()) {
+                Ok(data) => data,
+                Err(e) if manifest.is_some() => return Err(e.into()),
+                Err(_) => continue,
             };
             let jobs = sources(&data);
             let next = AtomicUsize::new(0);
@@ -219,25 +235,35 @@ pub fn run(
                                     .flatten(),
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                                translate(job, entry.path(), &seen, &mut t, &mut checks);
+                                if manifest.is_some() {
+                                    crate::fingerprints::collect(job, &seen, &fingerprints);
+                                } else {
+                                    translate(job, entry.path(), &seen, &mut t, &mut checks);
+                                }
                             }
                             lock(&total).merge(t);
                         })
                     })
                     .collect();
-                report(
-                    entry.path(),
-                    jobs.len(),
-                    "containers",
-                    &next,
-                    started,
-                    &workers,
-                    String::new,
-                );
+                if manifest.is_none() {
+                    report(
+                        entry.path(),
+                        jobs.len(),
+                        "containers",
+                        &next,
+                        started,
+                        &workers,
+                        String::new,
+                    );
+                }
             });
         }
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
+    if let Some(path) = manifest {
+        println!("files above the scanner size limit: {skipped_large_files}");
+        return lock(&fingerprints).save(path);
+    }
     println!(
         "containers   {} ({} duplicates skipped)",
         t.containers, t.duplicates
@@ -860,7 +886,7 @@ mod tests {
         // SAFETY: no other test in this binary touches the environment.
         unsafe { std::env::set_var("VICTORY_EMIT_DUMP", env!("CARGO_MANIFEST_DIR")) };
         let missing = std::env::temp_dir().join("victory-translate-no-such-dir");
-        let err = super::run(vec![missing], false, false, false, Some(1)).unwrap_err();
+        let err = super::run(vec![missing], false, false, false, Some(1), None).unwrap_err();
         // SAFETY: as above; unset so a later test's `run` is not refused.
         unsafe { std::env::remove_var("VICTORY_EMIT_DUMP") };
         assert!(
