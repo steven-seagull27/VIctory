@@ -386,13 +386,15 @@ pub(crate) fn save(now: bool) {
         }
         return;
     };
+    // The prebuilt keys describe this exact blob. An early-list write can
+    // retry on its own, so install the matching keys before attempting it.
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
         .and_then(|()| match &prebuilt {
             Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
             None => Ok(()),
-        });
+        })
+        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     let (created, distinct) = created();
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
