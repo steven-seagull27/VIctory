@@ -612,8 +612,8 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, None, |t, l, len| {
-            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+        self.detile_runs(tiled, mip, slice, linear.len(), row_pitch, depth_pitch, None, |at, src| {
+            linear[at..][..src.len()].copy_from_slice(src);
         })
     }
 
@@ -632,8 +632,28 @@ impl Layout {
         depth_pitch: usize,
         rows: std::ops::Range<u32>,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, Some(rows), |t, l, len| {
-            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+        self.detile_runs(tiled, mip, slice, linear.len(), row_pitch, depth_pitch, Some(rows), |at, src| {
+            linear[at..][..src.len()].copy_from_slice(src);
+        })
+    }
+
+    /// Visits the detiled runs of a subresource or row band. Offsets and pitches
+    /// are in bytes of the source texel format. A writer that expands the texels
+    /// can scale each offset directly into its destination.
+    #[allow(clippy::too_many_arguments)]
+    pub fn detile_runs(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear_len: usize,
+        row_pitch: usize,
+        depth_pitch: usize,
+        rows: Option<std::ops::Range<u32>>,
+        mut write: impl FnMut(usize, &[u8]),
+    ) -> Result<(), Error> {
+        self.walk(tiled.len(), mip, slice, linear_len, row_pitch, depth_pitch, rows, |t, l, len| {
+            write(l, &tiled[t..][..len]);
         })
     }
 

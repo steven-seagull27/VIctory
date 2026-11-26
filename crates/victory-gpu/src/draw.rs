@@ -3202,6 +3202,82 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// Two writes to tracked guest pages update sampled textures. Writable
+    /// RGBA8 stand-ins take their initial packed pixels from title memory once.
+    #[test]
+    fn packed_page_updates_respect_texture_ownership() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const WIDTH: usize = 64; // READ's output row
+        const HEIGHT: usize = 1536;
+        let page = crate::watch::PAGE;
+        let read = compile_cs(READ);
+        let slots = Slots::new(1);
+        let (output, mapped) = host.shared_buffer((WIDTH * HEIGHT * 16) as u64).unwrap();
+        let pool = crate::watch::tests::pool(32);
+        for (index, (format, flags, [blue, green, red])) in [
+            (86, 0, [0x801f, 0x83e0, 0x7c00]), (86, 5, [0x801f, 0x83e0, 0x7c00]),
+            (115, 0, [0xf00f, 0xf0f0, 0x0f00]), (115, 5, [0xf00f, 0xf0f0, 0x0f00]),
+        ].into_iter().enumerate() {
+            let writable = flags != 0;
+            if writable && crate::resource::target_format(format) == format {
+                continue; // Native writable targets get their contents from the GPU.
+            }
+            let address = pool + index * 8 * page;
+            let object = texture_at_address(address as u64, &texture_words(WIDTH as u32, HEIGHT as u32, format, 0x100, flags));
+            let (_, desc) = crate::resource::texture_memory(object).unwrap();
+            let layout = crate::resource::texture_layout(&desc).unwrap().planes[0].layout.clone();
+            let stride = layout.offset(0, 0, 1, 0).unwrap() as usize;
+            assert!(layout.size as usize <= page * 8 && page.is_multiple_of(stride));
+            let band = page / stride;
+            assert!(HEIGHT > 2 * band);
+            let fill = |offset: usize, len: usize, packed: u16| {
+                assert!(offset + len <= layout.size as usize);
+                let _write = crate::watch::writing(address + offset, len);
+                // SAFETY: this test owns the tracked allocation, with no submission in flight.
+                unsafe { std::slice::from_raw_parts_mut((address + offset) as *mut u16, len / 2) }.fill(packed);
+            };
+            fill(0, layout.size as usize, blue);
+            let copy = crate::resource::host_copy(object).unwrap();
+            // SAFETY: this test holds the resource while it checks the actual representation.
+            assert_eq!(unsafe { copy.texture.GetDesc() }.Format.0 as u32, if writable { 28 } else { format });
+            let mut srv = [0; 10];
+            srv[..6].copy_from_slice(&[format, 4, 0x1688, 0, 0, 1]);
+            let view = View::Shader(object as usize, Some(srv));
+            slots.make(0, &view);
+            for step in 0..3 {
+                if step == 1 {
+                    fill(page, page, green);
+                } else if step == 2 {
+                    fill(0, page, red);
+                }
+                let list = host.new_list().unwrap();
+                readable(&list, &used(ResourceType::Srv), &view, false);
+                run(&list, &slots, &read, 0, Some(&output), (8, HEIGHT as u32 / 8));
+                list.close();
+                let before = crate::texture::copied(object);
+                host.execute(&[&list]);
+                assert_eq!(crate::texture::copied(object) - before, u64::from(step == 0 || !writable));
+                // SAFETY: execution finished and each invocation wrote one float4.
+                let pixels = unsafe { std::slice::from_raw_parts(mapped.cast::<[f32; 4]>(), WIDTH * HEIGHT) };
+                for (i, &got) in pixels.iter().enumerate() {
+                    let (x, y) = (i % WIDTH, i / WIDTH);
+                    let want = if !writable && step == 2 && y < band {
+                        [1.0, 0.0, 0.0, 0.0]
+                    } else if !writable && step >= 1 && (band..2 * band).contains(&y) {
+                        [0.0, 1.0, 0.0, 1.0]
+                    } else {
+                        [0.0, 0.0, 1.0, 1.0]
+                    };
+                    assert_eq!(got, want, "format {format}, step {step}, pixel ({x},{y})");
+                }
+            }
+            crate::object::release(object);
+        }
+        crate::watch::tests::free(pool);
+    }
+
     /// A depth texture with stencil (the console's 16-bit depth, the
     /// host's 32-bit float) written through unordered views of its planes,
     /// then read as depth and stencil: the 16-bit depth arrives as the
