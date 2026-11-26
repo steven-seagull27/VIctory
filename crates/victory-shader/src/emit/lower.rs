@@ -1809,9 +1809,55 @@ impl<'a> Lower<'a> {
         Ok(self.memory(lo, hi, bytes, write, active))
     }
 
+    /// Evaluates a VALU mask operand (`v_cndmask_b32` or `*_co_ci_u32` `src[2]`)
+    /// to this lane's boolean bit at block `c`.
+    fn mask_operand(
+        &mut self,
+        inst: &Inst,
+        op: Option<&Operand>,
+        c: usize,
+        why: Why,
+    ) -> Result<V, Why> {
+        match op {
+            Some(&Operand::Scalar { code, .. }) if code == NULL => Ok(self.s.m.bool(false)),
+            Some(&Operand::Scalar { code, .. }) => {
+                let m = inst
+                    .read(Reg::S(code))
+                    .and_then(|m| {
+                        self.x
+                            .st
+                            .masks
+                            .get(&m)
+                            .or_else(|| self.x.st.other.get(&m))
+                            .copied()
+                    })
+                    .ok_or(why)?;
+                self.boolean(m, c)
+            }
+            Some(&Operand::Const(k)) => {
+                let x = crate::resource::inline(k).ok_or(why)?;
+                if x == 0 {
+                    Ok(self.s.m.bool(false))
+                } else if x == u32::MAX {
+                    Ok(self.s.m.bool(true))
+                } else if self.console_lanes {
+                    let lo = self.s.m.i32(x);
+                    let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
+                    Ok(self.lane_bit(c, lo, Some(hi)))
+                } else {
+                    Err("a constant lane mask")
+                }
+            }
+            _ => Err(why),
+        }
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
+        if let Some(&orig) = self.x.st.restored.get(&v) {
+            return self.mask_dword(orig);
+        }
         let (lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
             None => (v, false),
@@ -1941,17 +1987,24 @@ impl<'a> Lower<'a> {
                 }
                 _ => {
                     let c = word(self, 1, h)?;
-                    // (operation, complement of src1, complement of the result)
-                    let (f, not_c, not_r) = match op {
-                        "and" => (Bin::And, false, false),
-                        "or" => (Bin::Or, false, false),
-                        "xor" => (Bin::Xor, false, false),
-                        "andn2" => (Bin::And, true, false),
-                        "orn2" => (Bin::Or, true, false),
-                        "nand" => (Bin::And, false, true),
-                        "nor" => (Bin::Or, false, true),
-                        "xnor" => (Bin::Xor, false, true),
+                    // (operation, complement of src0, complement of src1, complement of the result)
+                    let (f, not_a, not_c, not_r) = match op {
+                        "and" => (Bin::And, false, false, false),
+                        "or" => (Bin::Or, false, false, false),
+                        "xor" => (Bin::Xor, false, false, false),
+                        "andn1" => (Bin::And, true, false, false),
+                        "orn1" => (Bin::Or, true, false, false),
+                        "andn2" => (Bin::And, false, true, false),
+                        "orn2" => (Bin::Or, false, true, false),
+                        "nand" => (Bin::And, false, false, true),
+                        "nor" => (Bin::Or, false, false, true),
+                        "xnor" => (Bin::Xor, false, false, true),
                         _ => return Err(ELSEWHERE),
+                    };
+                    let a = if not_a {
+                        self.s.m.bin(at, Bin::Xor, a, ones)
+                    } else {
+                        a
                     };
                     let c = if not_c {
                         self.s.m.bin(at, Bin::Xor, c, ones)
@@ -6026,11 +6079,18 @@ impl<'a> Lower<'a> {
                 let (lo, hi) = self.split64(r);
                 self.write(inst, Reg::V(reg), lo, guard);
                 self.write(inst, Reg::V(reg + 1), hi, guard);
-                if !signed
-                    && let Some(Operand::Scalar { code, .. }) = v.carry
+                if let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))
                 {
-                    let carry = self.s.m.cmp(c, pred::IULT, r, addend);
+                    let carry = if signed {
+                        let pr = self.s.m.bin(c, Bin::Xor, p, r);
+                        let ar = self.s.m.bin(c, Bin::Xor, addend, r);
+                        let ov = self.s.m.bin(c, Bin::And, pr, ar);
+                        let zero = self.s.m.int_const(i64t, 0);
+                        self.s.m.cmp(c, pred::SLT, ov, zero)
+                    } else {
+                        self.s.m.cmp(c, pred::IULT, r, addend)
+                    };
                     self.lane_bits.insert(w, carry);
                 }
                 for &(_, w) in &inst.writes {
@@ -6528,38 +6588,7 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_cndmask_b32" => {
-                let cond = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => {
-                        let m = inst
-                            .read(Reg::S(code))
-                            .and_then(|m| {
-                                self.x
-                                    .st
-                                    .masks
-                                    .get(&m)
-                                    .or_else(|| self.x.st.other.get(&m))
-                                    .copied()
-                            })
-                            .ok_or("a select on an untracked mask")?;
-                        self.boolean(m, c)?
-                    }
-                    Some(&Operand::Const(k)) => {
-                        let x =
-                            crate::resource::inline(k).ok_or("a select on an untracked mask")?;
-                        if x == 0 {
-                            self.s.m.bool(false)
-                        } else if x == u32::MAX {
-                            self.s.m.bool(true)
-                        } else if self.console_lanes {
-                            let lo = self.s.m.i32(x);
-                            let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
-                            self.lane_bit(c, lo, Some(hi))
-                        } else {
-                            return Err("a constant lane mask");
-                        }
-                    }
-                    _ => return Err("a select on an untracked mask"),
-                };
+                let cond = self.mask_operand(inst, v.src.get(2), c, "a select on an untracked mask")?;
                 if v.abs != 0 || v.neg != 0 {
                     // Sign-bit moves on the bits a select passes through
                     // (a host `fabs`/`fneg` may flush a denormal).
@@ -6601,14 +6630,12 @@ impl<'a> Lower<'a> {
                     std::mem::swap(&mut a, &mut bb);
                 }
                 let cin = if name.ends_with("_ci_u32") {
-                    let m = match v.src.get(2) {
-                        Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                        _ => None,
-                    };
-                    let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
-                        .ok_or("a carry-in from an untracked mask")?;
-                    Some(self.boolean(m, c)?)
+                    Some(self.mask_operand(
+                        inst,
+                        v.src.get(2),
+                        c,
+                        "a carry-in from an untracked mask",
+                    )?)
                 } else {
                     None
                 };
@@ -10897,18 +10924,32 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                let key = self.x.st.highs.get(&arg).copied().unwrap_or(arg);
                 const UNTRACKED: Why = "a lane-mask join of an untracked mask";
                 // Data joined with masks where the wave takes one edge (the BVH
                 // walks pop masks from memory): with console lanes the lane's
                 // own bit of the number, as `Atom::Opaque`.
                 let number = self.console_lanes && !self.x.native.wave64 && self.uniform_join(b);
-                let x = match (self.x.st.masks.get(&arg), self.vals.get(&arg)) {
-                    (Some(&m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
-                    (None, Some(&Val::I32(word))) if number => self.lane_bit(qb, word, None),
-                    (None, _) if !self.uniform_join(b) && self.no_mask_lane_on_edge(b, &phi.args, n) => {
-                        self.s.m.bool(false)
+                let mask = self
+                    .x
+                    .st
+                    .masks
+                    .get(&key)
+                    .or_else(|| self.x.st.other.get(&key));
+                let x = if self.never_taken(q, b) {
+                    self.s.m.bool(false)
+                } else {
+                    match (mask, self.vals.get(&arg)) {
+                        (Some(&m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
+                        (None, Some(&Val::I32(word))) if number => self.lane_bit(qb, word, None),
+                        (None, _)
+                            if !self.uniform_join(b)
+                                && self.no_mask_lane_on_edge(b, &phi.args, n) =>
+                        {
+                            self.s.m.bool(false)
+                        }
+                        (None, _) => return Err(unsupported(offset, UNTRACKED)),
                     }
-                    (None, _) => return Err(unsupported(offset, UNTRACKED)),
                 };
                 incoming.push((x, qb));
             }
@@ -12207,5 +12248,48 @@ mod tests {
             lowers(&words, 0),
             Err(crate::ShaderError::Unsupported { what: "GDS", .. })
         ));
+    }
+
+    #[test]
+    fn loop_mask_phi_initialized_to_zero_lowers() {
+        lowers_valu(&[
+            0xBE80_0380, // s_mov_b32 s0, 0
+            0x7D84_0080, // 4: v_cmp_eq_u32_e32 vcc_lo, 0, v0
+            0x8800_6A00, // s_or_b32 s0, s0, vcc_lo
+            0xBF06_8101, // s_cmp_eq_u32 s1, 1
+            0xBF84_FFFC, // s_cbranch_scc0 -> 4
+            0xD501_0000,
+            0x0002_0501, // v_cndmask_b32_e64 v0, v1, v2, s0
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn spilled_mask_feeds_sop_and_reads_as_data() {
+        lowers_valu(&[
+            0x7D84_0080, // v_cmp_eq_u32_e32 vcc_lo, 0, v0
+            0xD761_0005,
+            0x0001_006A, // v_writelane_b32 v5, vcc_lo, 0
+            0xD760_000C,
+            0x0001_0105, // v_readlane_b32 s12, v5, 0
+            0xBE8D_070C, // s_not_b32 s13, s12
+            0xBE8D_0F0D, // s_bcnt1_i32_b32 s13, s13
+            0x7E00_020D, // v_mov_b32 v0, s13
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn carry_in_constant_and_mad_i64_carry_out_lower() {
+        lowers_valu(&[
+            0xBE8C_0380, // s_mov_b32 s12, 0
+            0xD528_0D00,
+            0x0032_0501, // v_add_co_ci_u32_e64 v0, s13, v1, v2, s12
+            0xD577_0E02,
+            0x0412_0300, // v_mad_i64_i32 v[2:3], s14, v0, v1, v[4:5]
+            0xD501_0000,
+            0x003A_0300, // v_cndmask_b32_e64 v0, v0, v1, s14
+        ])
+        .unwrap();
     }
 }

@@ -541,6 +541,9 @@ struct Lanes<'a> {
     scc_lane: Map<Value, Bool>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
+    /// Incoming arguments of `Atom::Phi` joins, so back-edge masks are also
+    /// resolved into `masks` or `other` once all edges are known.
+    phi_joins: Vec<Vec<Key>>,
     /// Per block: what a lane knows on entry, over forward edges only.
     first: Vec<Bool>,
     /// Per block ending in a branch: when a lane takes it.
@@ -612,6 +615,7 @@ impl<'a> Lanes<'a> {
             other: Map::default(),
             scc_lane: Map::default(),
             joins: Vec::new(),
+            phi_joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
@@ -690,6 +694,7 @@ impl<'a> Lanes<'a> {
         self.other.clear();
         self.scc_lane.clear();
         self.joins.clear();
+        self.phi_joins.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
@@ -797,22 +802,32 @@ impl<'a> Lanes<'a> {
     fn wrong_joins(&mut self, cond: &[Bool]) -> Vec<Value> {
         let mut wrong = Vec::new();
         let mut j = 0;
+        let mut p = 0;
         // Checking an argument can resolve another join; it is checked too.
-        while j < self.joins.len() {
-            let (block, id, value) = (self.joins[j].block, self.joins[j].id, self.joins[j].value);
-            for (n, a) in self.joins[j].args.clone().into_iter().enumerate() {
-                let (q, taken) = self.incoming[block][n];
-                let e = self.edge(cond[q], q, taken);
-                let mut m = self.mask(a).0;
-                if !value {
-                    m = self.b.not(m);
+        while j < self.joins.len() || p < self.phi_joins.len() {
+            while j < self.joins.len() {
+                let (block, id, value) =
+                    (self.joins[j].block, self.joins[j].id, self.joins[j].value);
+                for (n, a) in self.joins[j].args.clone().into_iter().enumerate() {
+                    let (q, taken) = self.incoming[block][n];
+                    let e = self.edge(cond[q], q, taken);
+                    let mut m = self.mask(a).0;
+                    if !value {
+                        m = self.b.not(m);
+                    }
+                    if !self.b.implies(e, m) {
+                        wrong.push(id);
+                        break;
+                    }
                 }
-                if !self.b.implies(e, m) {
-                    wrong.push(id);
-                    break;
-                }
+                j += 1;
             }
-            j += 1;
+            while p < self.phi_joins.len() {
+                for a in self.phi_joins[p].clone() {
+                    self.mask(a);
+                }
+                p += 1;
+            }
         }
         wrong
     }
@@ -1027,6 +1042,7 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
+        self.phi_joins.push(args);
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))
     }
@@ -1182,8 +1198,10 @@ impl<'a> Lanes<'a> {
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
                         let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
+                        let restored =
+                            self.restored.contains_key(&k.0) && self.restored.contains_key(&k.1);
                         takes_mask |= self.masks.contains_key(&k)
-                            || phi && !self.joins_loaded(k) && self.mask(k).1;
+                            || (phi && !self.joins_loaded(k) || restored) && self.mask(k).1;
                     }
                 }
                 let touches_exec =
@@ -1234,14 +1252,26 @@ impl<'a> Lanes<'a> {
                     l.masks.insert(k, m);
                     l.active.insert(k.0);
                 };
-                // A select reads a mask nothing else may: a join of compare
-                // results is resolved here, as for EXEC.
-                if name == "v_cndmask_b32"
+                // A select or carry-in reads a mask nothing else may: a join
+                // or constant is resolved here, as for EXEC.
+                if (name == "v_cndmask_b32" || name.ends_with("_co_ci_u32"))
                     && let Some(&Operand::Scalar { code, .. }) = v.src.get(2)
                     && code != NULL
                     && let Some(k) = self.key(|r| inst.read(r), code)
                 {
                     self.mask(k);
+                }
+                // A wave32 mask restored from a VGPR lane via `v_readlane_b32`
+                // keeps its mask identity without claiming EXEC at the restore.
+                if !self.p.wave64
+                    && name == "v_readlane_b32"
+                    && let Some(&(_, r)) = inst.writes.first()
+                    && self
+                        .restored
+                        .get(&r)
+                        .is_some_and(|&orig| self.masks.contains_key(&(orig, orig)))
+                {
+                    self.mask((r, r));
                 }
                 if name.starts_with("v_cmpx") {
                     if let Some(k) = self.key(|r| inst.write(r), EXEC) {
@@ -1730,6 +1760,76 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn restored_mask_feeds_sop_mask_op() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc_lo, 0, v0
+                0xD761_0005,
+                0x0001_006A, // v_writelane_b32 v5, vcc_lo, 0
+                0xD760_0006,
+                0x0001_0105, // v_readlane_b32 s6, v5, 0
+                0x8701_7E06, // s_and_b32 s1, s6, exec_lo
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let read = p.blocks[0].insts[2].write(Reg::S(6)).unwrap();
+        let and = p.blocks[0].insts[3].write(Reg::S(1)).unwrap();
+        assert!(s.masks.contains_key(&read), "restored wave32 mask tracked");
+        assert!(s.masks.contains_key(&and), "SOP reading restored mask tracked");
+    }
+
+    #[test]
+    fn loop_mask_phi_with_zero_init_resolves_all_args() {
+        let p = build(
+            &[
+                0xBE80_0380, // s_mov_b32 s0, 0
+                0x7D84_0080, // 4: v_cmp_eq_u32_e32 vcc_lo, 0, v0
+                0x8800_6A00, // s_or_b32 s0, s0, vcc_lo
+                0xBF06_8101, // s_cmp_eq_u32 s1, 1
+                0xBF84_FFFC, // s_cbranch_scc0 -> 4
+                0xD501_0000,
+                0x0002_0501, // v_cndmask_b32_e64 v0, v1, v2, s0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let header = &p.blocks[1];
+        let phi = header.phis.iter().find(|ph| ph.reg == Reg::S(0)).unwrap();
+        assert!(
+            s.masks.contains_key(&phi.value) || s.other.contains_key(&phi.value),
+            "loop mask phi tracked"
+        );
+        for &arg in &phi.args {
+            assert!(
+                s.masks.contains_key(&arg) || s.other.contains_key(&arg),
+                "every incoming phi arg (entry constant and back edge) must be resolved"
+            );
+        }
+    }
+
+    #[test]
+    fn carry_in_from_constant_is_tracked() {
+        let p = build(
+            &[
+                0xBE86_0380, // s_mov_b32 s6, 0
+                0xD528_0700,
+                0x001A_0501, // v_add_co_ci_u32_e64 v0, s7, v1, v2, s6
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let cin = p.blocks[0].insts[0].write(Reg::S(6)).unwrap();
+        assert!(
+            s.other.contains_key(&cin),
+            "constant carry-in resolved into st.other"
+        );
     }
 
     /// [`Bools::vars`] as it was: lists of the nodes and variables seen.
