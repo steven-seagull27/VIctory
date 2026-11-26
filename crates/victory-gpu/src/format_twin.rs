@@ -212,8 +212,21 @@ mod tests {
     /// submission's prelude ran.
     #[test]
     fn a_twin_takes_its_textures_bytes_at_submission() {
+        check_twin_write_order(false);
+    }
+
+    /// Compare a write and a later read in one command list with a read
+    /// submitted after the write. A same-submission twin should see each write.
+    #[test]
+    #[ignore = "the fallback twin is currently refreshed only at submission start"]
+    fn a_twin_sees_an_earlier_write_in_the_same_list() {
+        check_twin_write_order(true);
+    }
+
+    fn check_twin_write_order(update_in_list: bool) {
         let Some(host) = host() else {
-            return; // no host GPU here
+            eprintln!("no host GPU; skipped format-twin readbacks");
+            return;
         };
         const W: u32 = 8;
         const H: u32 = 4;
@@ -257,38 +270,105 @@ mod tests {
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
         };
-        // The texture's contents, uploaded by one submission.
-        let upload = host.new_list().unwrap();
-        let (buffer, data) = upload.upload(host, u64::from(PITCH * H)).unwrap();
-        for y in 0..H {
-            for x in 0..W {
-                // SAFETY: inside the mapped upload buffer.
-                unsafe { data.add((y * PITCH + x * 4) as usize).cast::<u32>().write_unaligned(texel(x, y)) };
+        let write_source = |list: &crate::host::HostList, mask: u32| {
+            let (buffer, data) = list.upload(host, u64::from(PITCH * H)).unwrap();
+            for y in 0..H {
+                for x in 0..W {
+                    // SAFETY: this texel lies in the mapped upload buffer.
+                    unsafe {
+                        data.add((y * PITCH + x * 4) as usize)
+                            .cast::<u32>()
+                            .write_unaligned(texel(x, y) ^ mask)
+                    };
+                }
             }
-        }
-        // SAFETY: an open list; the texture is in the copy-destination state.
-        unsafe { upload.list.CopyTextureRegion(&at(&source.texture), 0, 0, 0, &placed(&buffer, footprint(DXGI_FORMAT_R32_UINT)), None) };
-        upload.close();
-        host.execute(&[&upload]);
-        // The next one's prelude copies them into the twin; it reads them back.
-        let read = host.new_list().unwrap();
-        let (back, bytes) = read.readback(host, u64::from(PITCH * H)).unwrap();
-        let st = |a: u32, b: u32| crate::host::transition(&twin.texture, D3D12_RESOURCE_STATES(a as i32), D3D12_RESOURCE_STATES(b as i32));
-        // SAFETY: an open list; the twin is readable by shaders after the prelude.
-        unsafe {
-            read.list.ResourceBarrier(&[st(SHADER_RESOURCE, COPY_SOURCE)]);
-            read.list.CopyTextureRegion(&placed(&back, footprint(DXGI_FORMAT(67))), 0, 0, 0, &at(&twin.texture), None);
-            read.list.ResourceBarrier(&[st(COPY_SOURCE, SHADER_RESOURCE)]);
-        }
-        read.close();
-        host.execute(&[&read]);
-        for y in 0..H {
-            for x in 0..W {
-                // SAFETY: inside the mapped readback buffer; the GPU is done.
-                let got = unsafe { bytes.add((y * PITCH + x * 4) as usize).cast::<u32>().read_unaligned() };
-                assert_eq!(got, texel(x, y), "texel {x},{y}");
+            // SAFETY: open list, source texture in COPY_DEST.
+            unsafe {
+                list.list.CopyTextureRegion(
+                    &at(&source.texture),
+                    0,
+                    0,
+                    0,
+                    &placed(&buffer, footprint(DXGI_FORMAT_R32_UINT)),
+                    None,
+                )
+            };
+        };
+        let seed = host.new_list().unwrap();
+        write_source(&seed, 0);
+        seed.close();
+        host.execute(&[&seed]);
+
+        let check = |write: bool, mask: u32| {
+            let list = host.new_list().unwrap();
+            if write {
+                write_source(&list, mask);
             }
+            let copy_out = |texture: &ID3D12Resource, format, state| {
+                let (buffer, bytes) = list.readback(host, u64::from(PITCH * H)).unwrap();
+                let barrier = |a: u32, b: u32| {
+                    transition(
+                        texture,
+                        D3D12_RESOURCE_STATES(a as i32),
+                        D3D12_RESOURCE_STATES(b as i32),
+                    )
+                };
+                // SAFETY: each texture is transitioned for the copy and restored before returning.
+                unsafe {
+                    list.list.ResourceBarrier(&[barrier(state, COPY_SOURCE)]);
+                    list.list.CopyTextureRegion(
+                        &placed(&buffer, footprint(format)),
+                        0,
+                        0,
+                        0,
+                        &at(texture),
+                        None,
+                    );
+                    list.list.ResourceBarrier(&[barrier(COPY_SOURCE, state)]);
+                }
+                (buffer, bytes)
+            };
+            let (_original, original_bytes) =
+                copy_out(&source.texture, DXGI_FORMAT_R32_UINT, COPY_DEST);
+            let (_mirror, mirror_bytes) = copy_out(&twin.texture, DXGI_FORMAT(67), SHADER_RESOURCE);
+            list.close();
+            host.execute(&[&list]);
+            let mut matching = 0;
+            let mut previous = 0;
+            for y in 0..H {
+                for x in 0..W {
+                    let offset = (y * PITCH + x * 4) as usize;
+                    // SAFETY: both mapped ranges contain these texels and the submitted work has finished.
+                    let (original, mirror) = unsafe {
+                        (
+                            original_bytes.add(offset).cast::<u32>().read_unaligned(),
+                            mirror_bytes.add(offset).cast::<u32>().read_unaligned(),
+                        )
+                    };
+                    assert_eq!(original, texel(x, y) ^ mask, "source {x},{y}");
+                    matching += u32::from(mirror == original);
+                    previous += u32::from(mirror == texel(x, y));
+                }
+            }
+            eprintln!(
+                "twin readback: same-list write={write}, source={}/{}, twin={matching}/{}, seed={previous}/{}",
+                W * H,
+                W * H,
+                W * H,
+                W * H
+            );
+            matching
+        };
+        let mask = if update_in_list { u32::MAX } else { 0 };
+        let first = check(update_in_list, mask);
+        if update_in_list {
+            assert_eq!(check(false, mask), W * H, "next submission");
         }
-        assert_eq!(source.state.load(Relaxed), COPY_DEST, "the texture left as it was");
+        assert_eq!(first, W * H, "twin after source write");
+        assert_eq!(
+            source.state.load(Relaxed),
+            COPY_DEST,
+            "the texture left as it was"
+        );
     }
 }
