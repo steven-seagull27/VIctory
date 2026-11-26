@@ -1764,6 +1764,70 @@ fn user_data_cs32(shader: &HostShader, k: u32) -> Vec<u32> {
     ud
 }
 
+#[test]
+fn parallel_dispatches_keep_each_workers_readback() {
+    use std::sync::Barrier;
+    use windows::Win32::Graphics::Dxgi::*;
+
+    const WORKERS: usize = 8;
+    const ROUNDS: usize = 16;
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(probe) = Host::new(false) else {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
+    };
+    // SAFETY: resolve the adapter of the live device for the test report.
+    let desc = unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+        let adapter: IDXGIAdapter1 = factory
+            .EnumAdapterByLuid(probe.device.GetAdapterLuid())
+            .unwrap();
+        adapter.GetDesc1().unwrap()
+    };
+    let adapter = String::from_utf16_lossy(&desc.Description);
+    let shader = build_valu_cs(&[vop1(1, 0, sgpr(0))]); // Copy s0 to UAV word 0.
+    let ready = Barrier::new(WORKERS);
+    std::thread::scope(|scope| {
+        for worker in 0..WORKERS {
+            let (shader, ready) = (&shader, &ready);
+            scope.spawn(move || {
+                let setup = Host::new(false).and_then(|host| {
+                    let (root, pso) = host.compute_pipeline(shader)?;
+                    Ok((host, root, pso))
+                });
+                // Every worker reaches the barrier even if its pipeline failed.
+                ready.wait();
+                let (host, root, pso) = setup.expect("worker compute pipeline");
+                for round in 0..ROUNDS {
+                    let payload = 0x5080_0000 + (worker * ROUNDS + round) as u32;
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![(0, Root::Constants(user_data_cs32(shader, payload)))],
+                                views: &[View::RawUav(2)],
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .expect("worker dispatch");
+                    assert_eq!(
+                        out.as_slice(),
+                        &[[payload, 0]],
+                        "worker {worker}, round {round}"
+                    );
+                }
+            });
+        }
+    });
+    eprintln!(
+        "{}: {} distinct dispatch readbacks matched, including the untouched neighbor word",
+        adapter.trim_end_matches('\0'),
+        WORKERS * ROUNDS,
+    );
+}
+
 /// Image addresses with `a16` after a whole-VGPR operand (the offset or
 /// bias keeps a VGPR; the coordinates share the next) and the clamp of
 /// `image_sample_d_cl` (after the coordinates). Program 1: a biased sample
