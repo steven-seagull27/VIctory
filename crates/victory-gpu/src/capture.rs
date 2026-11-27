@@ -565,7 +565,12 @@ fn dump_one(
         // A 24-bit depth plane copies out as 32-bit words (`R32_TYPELESS`):
         // decode it as depth, not as floats (all denormals, shown black).
         let format = if matches!(d.Format.0, 44..=47) { d.Format.0 } else { f.Format.0 };
-        if let Some(rgba) = to_rgba(format as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+        let packed = std::env::var("VICTORY_DUMP_RGB9E5_TARGETS").unwrap_or_default();
+        for (suffix, view) in target_views(DXGI_FORMAT(format), i, &packed) {
+            let Some(rgba) = to_rgba(view.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) else {
+                tracing::info!(format = view.0, ?resource, "target not dumped: format");
+                continue;
+            };
             let mut name = format!(
                 "{prefix}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
@@ -576,16 +581,22 @@ fn dump_one(
                 name.push_str("-by-");
                 name.push_str(&by);
             }
+            name.push_str(suffix);
             // Whether anything but zeros is there (a dump is normalized).
             if rgba.chunks(4).all(|p| p[..3] == [0, 0, 0]) {
                 name.push_str("-black");
             }
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
-        } else {
-            tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
         buffer.Unmap(0, None);
     }
+}
+
+/// Keep the native view first. Only the R32_UINT targets explicitly named by number get a second view.
+fn target_views(format: DXGI_FORMAT, index: usize, packed_targets: &str) -> impl Iterator<Item = (&'static str, DXGI_FORMAT)> {
+    let packed = format == DXGI_FORMAT_R32_UINT
+        && packed_targets.split(',').any(|value| value.trim().parse::<usize>() == Ok(index));
+    std::iter::once(("", format)).chain(packed.then_some(("-as-rgb9e5", DXGI_FORMAT_R9G9B9E5_SHAREDEXP)))
 }
 
 fn half(h: u16) -> f32 {
@@ -857,6 +868,29 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod rgb9e5_tests {
+    #[test]
+    fn selected_r32_target_views_preserve_words_and_separate_rgb_channels() {
+        use super::{DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, target_views, to_rgba};
+
+        let mut rows = [0xffu8; 256 + 8];
+        for (start, word) in [(0, 0x8000_0100u32), (4, 0x8002_0000), (256, 0x8400_0000), (260, 0)] {
+            rows[start..start + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let views = |index, selected| {
+            target_views(DXGI_FORMAT_R32_UINT, index, selected)
+                .map(|(suffix, format)| (suffix, to_rgba(format.0 as u32, 2, 2, 256, &rows).unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let native = to_rgba(DXGI_FORMAT_R32_UINT.0 as u32, 2, 2, 256, &rows).unwrap();
+        assert!(native.as_chunks::<4>().0.iter().all(|&[r, g, b, a]| r == g && g == b && a == 255));
+        let gray = ("", native);
+        let rgb = ("-as-rgb9e5", vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 0, 0, 0, 255]);
+        assert_eq!(views(7, ""), [gray.clone()]);
+        assert_eq!(views(0, "2, 07"), [gray.clone()]);
+        assert_eq!(views(7, "2, 07"), [gray, rgb]);
+        assert_eq!(target_views(DXGI_FORMAT_R9G9B9E5_SHAREDEXP, 7, "7").count(), 1);
+    }
+
     #[test]
     fn rgb9e5_target_decodes_pitched_rows_with_shared_exponents() {
         use super::{DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, to_rgba};
