@@ -69,7 +69,16 @@ const IN_HALF: &[u32] = &[
 fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u32>, String> {
     let target = host.target();
     let cs = emit_for(native, target).map_err(|e| e.to_string())?;
-    let (root, pso) = host.compute_pipeline(&cs)?;
+    run_emitted(host, native, &cs, groups)
+}
+
+fn run_emitted(
+    host: &Host,
+    native: &crate::NativeProgram,
+    cs: &super::HostShader,
+    groups: u32,
+) -> Result<Vec<u32>, String> {
+    let (root, pso) = host.compute_pipeline(cs)?;
     let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
     let StageIo::Cs(io) = &native.io else {
         unreachable!()
@@ -432,4 +441,72 @@ fn a_mask_copied_dword_by_dword_stops_instead_of_recursing() {
             .to_string();
         assert!(e.contains(why), "{lanes_min}..{lanes_max}: {e}");
     }
+}
+
+/// The scalar AND of VCC and EXEC sets one SCC for the logical wave even
+/// when its only matching lane is in the upper half. Inactive lanes keep v2 = 0.
+#[test]
+fn branch_on_active_vcc_is_shared_by_the_console_wave() {
+    let target = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let host = Host::new(false).ok().filter(|h| h.target().runs(32));
+    for (lanes, active, inside) in [(32, 24, 21), (64, 48, 37)] {
+        let wide = lanes == 64;
+        for selected in [inside, active] {
+            let body = [
+                0x7E04_0280,                                  // v_mov_b32 v2, 0
+                0x7D88_0080 | active,                         // v_cmp_gt_u32 vcc, active, v0
+                if wide { 0xBE8C_246A } else { 0xBE8C_3C6A }, // save EXEC
+                0xBF88_0006,                                  // s_cbranch_execz -> restore
+                0x7D84_0080 | selected,                       // v_cmp_eq_u32 vcc, selected, v0
+                if wide { 0x8792_7E6A } else { 0x8712_7E6A }, // s_and s18, vcc, exec
+                0xBF84_0002,                                  // s_cbranch_scc0 -> value 1
+                0x7E04_0282,                                  // v_mov_b32 v2, 2
+                0xBF82_0001,                                  // s_branch -> restore
+                0x7E04_0281,                                  // v_mov_b32 v2, 1
+                if wide { 0xBEFE_040C } else { 0xBEFE_030C }, // restore EXEC
+            ];
+            let mut p = program(&body, lanes);
+            p.wave64 = wide;
+            let shader = emit_for(&p, target).unwrap();
+            assert_eq!(wave_size(&shader.dxil), Some(32));
+            if let Some(host) = &host {
+                let actual = run_emitted(host, &p, &shader, 2).unwrap();
+                let expected: Vec<_> = (0..2 * lanes)
+                    .map(|t| {
+                        if t % lanes < active {
+                            1 + u32::from(selected < active)
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                assert_eq!(actual, expected, "Wave{lanes}, selected {selected}");
+            }
+        }
+    }
+}
+
+#[test]
+fn branch_votes_keep_multiwave_and_mixed_use_programs_on_their_existing_path() {
+    let target = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let mut body = vec![
+        0x7D84_00A5, // v_cmp_eq_u32 vcc, 37, v0
+        0x8792_7E6A, // s_and_b64 s[18:19], vcc, exec
+        0xBF84_0001, // s_cbranch_scc0 -> after the move
+        0x7E04_0282, // v_mov_b32 v2, 2
+    ];
+    let multi = emit_for(&program(&body, 128), target).unwrap();
+    assert_eq!(wave_size(&multi.dxil), None);
+    body.extend([
+        0x8794_7E6A, // s_and_b64 s[20:21], vcc, exec
+        0x8516_8081, // s_cselect_b32 s22, 1, 0
+    ]);
+    let mixed = emit_for(&program(&body, 64), target).unwrap();
+    assert_eq!(wave_size(&mixed.dxil), None);
 }

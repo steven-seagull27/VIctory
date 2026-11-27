@@ -433,6 +433,56 @@ const LANE_MASK: Why = "a lane mask read as data";
 pub(crate) const IMPLICIT_SAMPLE_IN_HALVES: Why =
     "an implicit-derivative sample in the console flow on a host without 64-lane waves";
 
+/// A branch whose SCC is the nonzero result of VCC & EXEC. A phi or a
+/// non-branch consumer of the same value needs separate lowering.
+fn branches_on_active_vcc(p: &Program, st: &Structured) -> bool {
+    use crate::ir::VCC;
+    let width = if p.wave64 { "s_and_b64" } else { "s_and_b32" };
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    let votes: HashSet<_> = insts()
+        .filter_map(|i| {
+            let Fields::Sop {
+                dst: Some(Operand::Scalar { code: dst, .. }),
+                src,
+                ..
+            } = &i.fields
+            else {
+                return None;
+            };
+            let [
+                Operand::Scalar { code: a, .. },
+                Operand::Scalar { code: b, .. },
+            ] = src.as_slice()
+            else {
+                return None;
+            };
+            if i.name() == width
+                && *dst != EXEC
+                && matches!((*a, *b), (VCC, EXEC) | (EXEC, VCC))
+                && i.write(Reg::S(*dst))
+                    .is_some_and(|v| st.masks.contains_key(&v))
+            {
+                i.write(Reg::Scc)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if votes.is_empty() {
+        return false;
+    }
+    let uses_vote = |i: &Inst| i.read(Reg::Scc).is_some_and(|s| votes.contains(&s));
+    let branch = |i: &Inst| matches!(i.name(), "s_cbranch_scc0" | "s_cbranch_scc1");
+    // Selecting the console flow changes the whole program. Leave mixed-use
+    // cases (including an SCC which feeds a phi) on their original path.
+    !p.blocks
+        .iter()
+        .flat_map(|b| &b.phis)
+        .any(|phi| phi.reg == Reg::Scc && phi.args.iter().any(|v| votes.contains(v)))
+        && !insts().any(|i| !branch(i) && uses_vote(i))
+        && insts().any(|i| branch(i) && uses_vote(i))
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -669,13 +719,15 @@ impl<'a> Lower<'a> {
             // The rest of such programs need the halves to exchange values
             // (masks read whole, lanes of the other half): the console flow,
             // for a group of one console wave without LDS.
-            wants_console_flow = console_lanes
-                && !split
-                && x.native.wave64
-                && !x.target.runs(64)
-                && x.target.runs(32)
+            // A branch on the SCC of VCC & EXEC is wave-wide, even when the
+            // program does not otherwise read a different lane. The console
+            // flow evaluates the vote and guards both arms with guest EXEC.
+            let halves_need_exchange =
+                console_lanes && !split && x.native.wave64 && !x.target.runs(64);
+            wants_console_flow = x.target.runs(32)
                 && s.lds_dwords == 0
-                && cs.threads.iter().product::<u32>() <= 64
+                && one_wave
+                && (halves_need_exchange || branches_on_active_vcc(p, x.st))
                 && !insts().any(|i| i.name().contains("permute"))
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
             if x.console_cf {
