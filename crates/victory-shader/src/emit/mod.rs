@@ -1791,6 +1791,9 @@ mod tests {
 
 #[cfg(test)]
 mod barycentric_tests {
+    #[cfg(windows)]
+    mod raster;
+
     use super::container::SigElement;
     use super::*;
     use crate::native::{PsInput, StageIo, Usage};
